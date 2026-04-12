@@ -18,6 +18,7 @@ type Config struct {
 type Providers struct {
 	Foodora   *FoodoraConfig   `json:"foodora,omitempty"`
 	Deliveroo *DeliverooConfig `json:"deliveroo,omitempty"`
+	UberEats  *UberEatsConfig  `json:"ubereats,omitempty"`
 }
 
 type FoodoraConfig struct {
@@ -43,6 +44,12 @@ type FoodoraConfig struct {
 type DeliverooConfig struct {
 	Market  string `json:"market,omitempty"`
 	BaseURL string `json:"base_url,omitempty"`
+}
+
+type UberEatsConfig struct {
+	BaseURL        string `json:"base_url,omitempty"`
+	BrowserProfile string `json:"browser_profile,omitempty"`
+	HTTPUserAgent  string `json:"http_user_agent,omitempty"`
 }
 
 func DefaultPath() (string, error) {
@@ -155,6 +162,16 @@ func (c *Config) Deliveroo() *DeliverooConfig {
 		c.Providers.Deliveroo = &DeliverooConfig{}
 	}
 	return c.Providers.Deliveroo
+}
+
+func (c *Config) UberEats() *UberEatsConfig {
+	if c.Providers.UberEats == nil {
+		c.Providers.UberEats = &UberEatsConfig{}
+	}
+	if c.Providers.UberEats.BaseURL == "" {
+		c.Providers.UberEats.BaseURL = "https://www.ubereats.com"
+	}
+	return c.Providers.UberEats
 }
 
 func (c FoodoraConfig) HasSession() bool {

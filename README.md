@@ -3,6 +3,7 @@
 Providers:
 - `foodora` (working)
 - `deliveroo` (work in progress; requires `DELIVEROO_BEARER_TOKEN`)
+- `ubereats` (browser-session backed; web account pages)
 
 Concepts (shared CLI UX; provider-specific implementations):
 - `history` (past orders)
@@ -158,6 +159,30 @@ export DELIVEROO_COOKIE='...' # optional
 ```
 
 `orders` looks for the most recent Deliveroo status URL in Atlas or Chrome history when no bearer token is present, then renders the page in headless Chromium and extracts the order details.
+
+## ubereats (browser-session backed)
+
+`ordercli` currently uses the logged-in Uber Eats web experience instead of a documented public consumer API. The first step is to create a persistent browser profile and sign in once:
+
+```sh
+./ordercli ubereats config set --browser-profile "$HOME/Library/Application Support/ordercli/ubereats-profile"
+./ordercli ubereats login --browser
+```
+
+After that:
+
+```sh
+./ordercli ubereats orders
+./ordercli ubereats history
+./ordercli ubereats history --limit 10
+./ordercli ubereats order <orderUuid>
+./ordercli ubereats order latest
+```
+
+Notes:
+- `login --browser` opens a real Playwright Chromium window and waits until you land on an Uber Eats orders page.
+- `orders`, `history`, and `order` reuse the stored browser profile in headless Chromium and extract order data from first-party JSON responses captured while the page loads.
+- If you are not signed in, commands fail with a prompt to run `ordercli ubereats login --browser`.
 
 ## Safety
 

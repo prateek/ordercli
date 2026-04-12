@@ -30,3 +30,16 @@ func newDeliverooCmd(st *state) *cobra.Command {
 	cmd.AddCommand(newDeliverooOrdersCmd(st))
 	return cmd
 }
+
+func newUberEatsCmd(st *state) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "ubereats",
+		Short: "Uber Eats",
+	}
+	cmd.AddCommand(newUberEatsConfigCmd(st))
+	cmd.AddCommand(newUberEatsLoginCmd(st))
+	cmd.AddCommand(newUberEatsOrdersCmd(st))
+	cmd.AddCommand(newUberEatsHistoryCmd(st))
+	cmd.AddCommand(newUberEatsOrderCmd(st))
+	return cmd
+}

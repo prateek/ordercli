@@ -20,22 +20,39 @@ import (
 var fetchScript []byte
 
 type Options struct {
-	Timeout    time.Duration
-	Headless   bool
-	LogWriter  io.Writer
-	Playwright string
+	Timeout                      time.Duration
+	Headless                     bool
+	LogWriter                    io.Writer
+	Playwright                   string
+	ProfileDir                   string
+	WaitForURLSubstrings         []string
+	CaptureResponseURLSubstrings []string
+	CaptureResponseBodyBytes     int
+}
+
+type CapturedResponse struct {
+	URL         string `json:"url"`
+	Status      int    `json:"status"`
+	ContentType string `json:"content_type,omitempty"`
+	Body        string `json:"body,omitempty"`
 }
 
 type Result struct {
-	FinalURL string `json:"final_url"`
-	Title    string `json:"title"`
-	Text     string `json:"text"`
+	FinalURL  string             `json:"final_url"`
+	Title     string             `json:"title"`
+	Text      string             `json:"text"`
+	UserAgent string             `json:"user_agent,omitempty"`
+	Responses []CapturedResponse `json:"responses,omitempty"`
 }
 
 type scriptInput struct {
-	URL           string `json:"url"`
-	TimeoutMillis int    `json:"timeout_millis"`
-	Headless      bool   `json:"headless"`
+	URL                          string   `json:"url"`
+	TimeoutMillis                int      `json:"timeout_millis"`
+	Headless                     bool     `json:"headless"`
+	ProfileDir                   string   `json:"profile_dir,omitempty"`
+	WaitForURLSubstrings         []string `json:"wait_for_url_substrings,omitempty"`
+	CaptureResponseURLSubstrings []string `json:"capture_response_url_substrings,omitempty"`
+	CaptureResponseBodyBytes     int      `json:"capture_response_body_bytes,omitempty"`
 }
 
 var runFetchScriptFunc = runFetchScript
@@ -66,9 +83,16 @@ func ReadText(ctx context.Context, targetURL string, opts Options) (Result, erro
 	outPath := filepath.Join(td, "out.json")
 
 	in := scriptInput{
-		URL:           targetURL,
-		TimeoutMillis: int(opts.Timeout.Milliseconds()),
-		Headless:      opts.Headless,
+		URL:                          targetURL,
+		TimeoutMillis:                int(opts.Timeout.Milliseconds()),
+		Headless:                     opts.Headless,
+		ProfileDir:                   strings.TrimSpace(opts.ProfileDir),
+		WaitForURLSubstrings:         append([]string(nil), opts.WaitForURLSubstrings...),
+		CaptureResponseURLSubstrings: append([]string(nil), opts.CaptureResponseURLSubstrings...),
+		CaptureResponseBodyBytes:     opts.CaptureResponseBodyBytes,
+	}
+	if len(in.CaptureResponseURLSubstrings) > 0 && in.CaptureResponseBodyBytes <= 0 {
+		in.CaptureResponseBodyBytes = 64 * 1024
 	}
 	b, _ := json.Marshal(in)
 
