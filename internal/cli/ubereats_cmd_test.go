@@ -34,6 +34,8 @@ type fakeUberEatsClient struct {
 	addCartItem           func(context.Context, string, string, int, string) (ubereats.CartMutation, error)
 	updateCartItem        func(context.Context, string, string, ubereats.CartItemUpdate) (ubereats.CartMutation, error)
 	updateCart            func(context.Context, string, ubereats.CartUpdate) (ubereats.CartMutation, error)
+	getCheckoutPreview    func(context.Context, string) (ubereats.CheckoutPreview, error)
+	checkoutCart          func(context.Context, string) (ubereats.CheckoutResult, error)
 	removeCartItem        func(context.Context, string, string) (ubereats.CartMutation, error)
 	discardCart           func(context.Context, string) (ubereats.CartMutation, error)
 }
@@ -118,6 +120,14 @@ func (f fakeUberEatsClient) UpdateCartItem(ctx context.Context, ref, cartItemRef
 
 func (f fakeUberEatsClient) UpdateCart(ctx context.Context, ref string, update ubereats.CartUpdate) (ubereats.CartMutation, error) {
 	return f.updateCart(ctx, ref, update)
+}
+
+func (f fakeUberEatsClient) GetCheckoutPreview(ctx context.Context, ref string) (ubereats.CheckoutPreview, error) {
+	return f.getCheckoutPreview(ctx, ref)
+}
+
+func (f fakeUberEatsClient) CheckoutCart(ctx context.Context, ref string) (ubereats.CheckoutResult, error) {
+	return f.checkoutCart(ctx, ref)
 }
 
 func (f fakeUberEatsClient) RemoveCartItem(ctx context.Context, ref, cartItemRef string) (ubereats.CartMutation, error) {
@@ -887,6 +897,78 @@ func TestUberEatsCLI_CartsCreateFromOrder_AddUpdateAndCartUpdate(t *testing.T) {
 	}
 	if !strings.Contains(out, `"updated": true`) || !strings.Contains(out, `"delivery_type": "PREMIUM_DELIVERY"`) {
 		t.Fatalf("unexpected carts update out=%s", out)
+	}
+}
+
+func TestUberEatsCLI_CartsCheckoutPreviewAndConfirm(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	oldFactory := uberEatsClientFactory
+	t.Cleanup(func() { uberEatsClientFactory = oldFactory })
+	uberEatsClientFactory = func(st *state, _ uberEatsCommand) uberEatsClient {
+		return fakeUberEatsClient{
+			getCheckoutPreview: func(_ context.Context, ref string) (ubereats.CheckoutPreview, error) {
+				if ref != "draft-2" {
+					t.Fatalf("preview ref=%q", ref)
+				}
+				return ubereats.CheckoutPreview{
+					Ref:      "draft-2",
+					Subtotal: "$25.30",
+					Total:    "$30.59",
+					Fees:     "$3.75",
+					Taxes:    "$1.54",
+					Tip:      "not set",
+					ETA:      "8:51–9:03 PM",
+					Cart: ubereats.Cart{
+						Ref:             "draft-2",
+						StoreTitle:      "Rosa Mexicano",
+						Address:         "222 E 39th St",
+						DeliveryType:    "PREMIUM_DELIVERY",
+						InteractionType: "leave_at_door",
+						CheckoutReady:   true,
+						SessionInfo: ubereats.SessionInfo{
+							LocationSource:    "TARGET",
+							LocationRef:       "loc-1",
+							Location:          "222 E 39th St",
+							Profile:           "Personal",
+							PaymentProfileRef: "payment-1",
+						},
+					},
+				}, nil
+			},
+			checkoutCart: func(_ context.Context, ref string) (ubereats.CheckoutResult, error) {
+				if ref != "draft-2" {
+					t.Fatalf("confirm ref=%q", ref)
+				}
+				return ubereats.CheckoutResult{
+					Ref: "draft-2",
+					Order: ubereats.Order{
+						UUID:        "order-1",
+						Merchant:    "Rosa Mexicano",
+						Status:      "Active",
+						Total:       "$69.26",
+						OccurredAt:  "2026-04-13T01:00:00Z",
+						SessionInfo: ubereats.SessionInfo{LocationSource: "TARGET", LocationRef: "loc-1"},
+					},
+					PaymentProviderConfirmationURL: "https://payments.example/confirm",
+				}, nil
+			},
+		}
+	}
+
+	out, _, err := runCLI(cfgPath, []string{"ubereats", "carts", "checkout", "draft-2"}, "")
+	if err != nil {
+		t.Fatalf("carts checkout: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "ref=draft-2") || !strings.Contains(out, "fees=$3.75") || !strings.Contains(out, "profile=Personal") {
+		t.Fatalf("unexpected carts checkout out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "carts", "checkout", "draft-2", "--confirm", "--json"}, "")
+	if err != nil {
+		t.Fatalf("carts checkout --confirm: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, `"payment_provider_confirmation_url": "https://payments.example/confirm"`) || !strings.Contains(out, `"uuid": "order-1"`) {
+		t.Fatalf("unexpected carts checkout --confirm out=%s", out)
 	}
 }
 

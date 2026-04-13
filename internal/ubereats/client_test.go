@@ -1772,6 +1772,346 @@ func TestClientUpdateCart_ErrorsWhenValidationErrorsAreReturned(t *testing.T) {
 	}
 }
 
+func TestClientGetCheckoutPreview_UsesCheckoutPresentation(t *testing.T) {
+	var checkoutPayload map[string]any
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"Rosa Mexicano","tagline1":{"text":"Subtotal: $25.30"},"tagline2":{"text":"Deliver to 222 E 39th St"},"itemCount":1,"action":"OPEN_CHECKOUT"}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"uuid":"draft-1",
+							"state":"UNORDERED",
+							"storeUuid":"store-1",
+							"deliveryType":"PREMIUM_DELIVERY",
+							"interactionType":"leave_at_door",
+							"paymentProfileUUID":"payment-1",
+							"deliveryAddress":{"fullAddress":"222 E 39th St"},
+							"shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","title":"Gummy Bears","quantity":1,"price":399}]}
+						}
+					}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.748198,"longitude":-73.9746683}}}]}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"selectedProfile":{"uuid":"profile-1","name":"Personal","defaultPaymentProfileUuid":"payment-1"}}}`), nil
+				case "/_p/api/getCheckoutPresentationV1":
+					rawBody, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("read checkout body: %v", err)
+					}
+					if err := json.Unmarshal(rawBody, &checkoutPayload); err != nil {
+						t.Fatalf("unmarshal checkout body: %v body=%s", err, string(rawBody))
+					}
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"draftOrderUUID":"draft-1",
+							"checkoutPayloads":{
+								"subtotal":{"subtotal":{"formattedValue":"$25.30"}},
+								"total":{"total":{"formattedValue":"$30.59"}},
+								"eta":{"rangeText":"8:51–9:03 PM"},
+								"fareBreakdown":{
+									"charges":[
+										{"title":{"text":"Subtotal"},"value":{"text":"$25.30"},"fareBreakdownChargeMetadata":{"analyticsInfo":[{"currencyAmount":{"amountE5":2530000,"currencyCode":"USD"}}]}},
+										{"title":{"text":"Delivery Fee"},"value":{"text":"$0.49"},"fareBreakdownChargeMetadata":{"analyticsInfo":[{"currencyAmount":{"amountE5":49000,"currencyCode":"USD"}}]}},
+										{"title":{"text":"Service Fee"},"value":{"text":"$3.26"},"fareBreakdownChargeMetadata":{"analyticsInfo":[{"currencyAmount":{"amountE5":326000,"currencyCode":"USD"}}]}},
+										{"title":{"text":"Taxes"},"value":{"text":"$1.54"},"fareBreakdownChargeMetadata":{"analyticsInfo":[{"currencyAmount":{"amountE5":154000,"currencyCode":"USD"}}]}}
+									]
+								}
+							},
+							"validationErrors":null
+						}
+					}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	preview, err := client.GetCheckoutPreview(context.Background(), "draft-1")
+	if err != nil {
+		t.Fatalf("GetCheckoutPreview: %v", err)
+	}
+	if preview.Ref != "draft-1" || preview.Cart.Ref != "draft-1" {
+		t.Fatalf("preview=%+v", preview)
+	}
+	if preview.Subtotal != "$25.30" || preview.Total != "$30.59" || preview.Fees != "$3.75" || preview.Taxes != "$1.54" || preview.Tip != "not set" {
+		t.Fatalf("preview=%+v", preview)
+	}
+	if preview.ETA != "8:51–9:03 PM" || preview.Cart.SessionInfo.Profile != "Personal" {
+		t.Fatalf("preview=%+v", preview)
+	}
+	payloadTypes, _ := checkoutPayload["payloadTypes"].([]any)
+	if len(payloadTypes) == 0 || checkoutPayload["draftOrderUUID"] != "draft-1" {
+		t.Fatalf("checkoutPayload=%v", checkoutPayload)
+	}
+}
+
+func TestClientGetCheckoutPreview_UsesDisplayFallbacksWithoutAnalytics(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"Cafe","tagline1":{"text":"Subtotal: €12.30"},"tagline2":{"text":"Deliver to 123 Main St"},"itemCount":1,"action":"OPEN_CHECKOUT"}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"uuid":"draft-1","state":"UNORDERED","storeUuid":"store-1","deliveryType":"PREMIUM_DELIVERY","interactionType":"leave_at_door","paymentProfileUUID":"payment-1","deliveryAddress":{"fullAddress":"123 Main St"},"shoppingCart":{"cartUuid":"cart-1","currencyCode":"EUR","isActive":true,"items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","title":"Latte","quantity":1,"price":1230}]}}}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"123 Main St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"selectedProfile":{"uuid":"profile-1","name":"Personal","defaultPaymentProfileUuid":"payment-1"}}}`), nil
+				case "/_p/api/getCheckoutPresentationV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"draftOrderUUID":"draft-1",
+							"checkoutPayloads":{
+								"subtotal":{"subtotal":{"formattedValue":"€12.30"}},
+								"total":{"total":{"formattedValue":"€16.80"}},
+								"fareBreakdown":{
+									"charges":[
+										{"title":{"text":"Subtotal"},"value":{"text":"€12.30"}},
+										{"title":{"text":"Service Fee"},"value":{"text":"€3.00"}},
+										{"title":{"text":"Taxes"},"value":{"text":"€1.50"}}
+									]
+								}
+							},
+							"validationErrors":null
+						}
+					}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	preview, err := client.GetCheckoutPreview(context.Background(), "draft-1")
+	if err != nil {
+		t.Fatalf("GetCheckoutPreview: %v", err)
+	}
+	if preview.Fees != "€3.00" || preview.Taxes != "€1.50" || preview.Tip != "not set" {
+		t.Fatalf("preview=%+v", preview)
+	}
+	if preview.ETA != "" {
+		t.Fatalf("expected empty eta, got %+v", preview)
+	}
+}
+
+func TestClientGetCheckoutPreview_ReportsExplicitZeroTip(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"Cafe","tagline1":{"text":"Subtotal: $12.30"},"tagline2":{"text":"Deliver to 123 Main St"},"itemCount":1,"action":"OPEN_CHECKOUT"}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"uuid":"draft-1","state":"UNORDERED","storeUuid":"store-1","deliveryType":"ASAP","interactionType":"leave_at_door","paymentProfileUUID":"payment-1","deliveryAddress":{"fullAddress":"123 Main St"},"shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","title":"Latte","quantity":1,"price":1230}]}}}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"123 Main St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"selectedProfile":{"uuid":"profile-1","name":"Personal","defaultPaymentProfileUuid":"payment-1"}}}`), nil
+				case "/_p/api/getCheckoutPresentationV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"draftOrderUUID":"draft-1",
+							"checkoutPayloads":{
+								"fareBreakdown":{
+									"charges":[
+										{"title":{"text":"Subtotal"},"value":{"text":"$12.30"},"fareBreakdownChargeMetadata":{"analyticsInfo":[{"currencyAmount":{"amountE5":1230000,"currencyCode":"USD"}}]}},
+										{"title":{"text":"Tip"},"value":{"text":"$0.00"},"fareBreakdownChargeMetadata":{"analyticsInfo":[{"currencyAmount":{"amountE5":0,"currencyCode":"USD"}}]}}
+									]
+								}
+							},
+							"validationErrors":null
+						}
+					}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	preview, err := client.GetCheckoutPreview(context.Background(), "draft-1")
+	if err != nil {
+		t.Fatalf("GetCheckoutPreview: %v", err)
+	}
+	if preview.Tip != "$0.00" {
+		t.Fatalf("preview=%+v", preview)
+	}
+}
+
+func TestClientCheckoutCart_UsesCheckoutEndpoint(t *testing.T) {
+	var checkoutPayload map[string]any
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"Rosa Mexicano","tagline1":{"text":"Subtotal: $25.30"},"tagline2":{"text":"Deliver to 222 E 39th St"},"itemCount":1,"action":"OPEN_CHECKOUT"}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"uuid":"draft-1",
+							"state":"UNORDERED",
+							"storeUuid":"store-1",
+							"deliveryType":"PREMIUM_DELIVERY",
+							"interactionType":"leave_at_door",
+							"paymentProfileUUID":"payment-1",
+							"deliveryAddress":{"fullAddress":"222 E 39th St"},
+							"shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","title":"Gummy Bears","quantity":1,"price":399}]}
+						}
+					}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.748198,"longitude":-73.9746683}}}]}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"selectedProfile":{"uuid":"profile-1","name":"Personal","defaultPaymentProfileUuid":"payment-1"}}}`), nil
+				case "/_p/api/checkoutOrdersByDraftOrdersV1":
+					rawBody, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("read checkout confirm body: %v", err)
+					}
+					if err := json.Unmarshal(rawBody, &checkoutPayload); err != nil {
+						t.Fatalf("unmarshal checkout confirm body: %v body=%s", err, string(rawBody))
+					}
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"orders":[{
+								"uuid":"order-1",
+								"orderInfo":{"storeInfo":{"name":"Rosa Mexicano"}},
+								"activeOrderOverview":{"subtitle":"3 items for $69.26","items":[{"title":"Taquitos","quantity":1}]},
+								"activeOrderStatus":{"currentProgress":1},
+								"status":"ACTIVE"
+							}],
+							"paymentProviderConfirmationUrl":"https://payments.example/confirm"
+						}
+					}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	result, err := client.CheckoutCart(context.Background(), "draft-1")
+	if err != nil {
+		t.Fatalf("CheckoutCart: %v", err)
+	}
+	if result.Ref != "draft-1" || result.Order.UUID != "order-1" || result.PaymentProviderConfirmationURL != "https://payments.example/confirm" {
+		t.Fatalf("result=%+v", result)
+	}
+	if checkoutPayload["draftOrderUUID"] != "draft-1" || checkoutPayload["paymentProfileUuid"] != "payment-1" {
+		t.Fatalf("checkoutPayload=%v", checkoutPayload)
+	}
+	extraParams, _ := checkoutPayload["extraParams"].(map[string]any)
+	if strings.TrimSpace(stringValue(extraParams["timezone"])) == "" {
+		t.Fatalf("checkoutPayload=%v", checkoutPayload)
+	}
+}
+
+func TestClientCheckoutCart_ErrorsWhenValidationErrorsReturned(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"Cafe","tagline1":{"text":"Subtotal: $12.30"},"tagline2":{"text":"Deliver to 123 Main St"},"itemCount":1,"action":"OPEN_CHECKOUT"}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"uuid":"draft-1","state":"UNORDERED","storeUuid":"store-1","deliveryType":"ASAP","interactionType":"leave_at_door","paymentProfileUUID":"payment-1","deliveryAddress":{"fullAddress":"123 Main St"},"shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","title":"Latte","quantity":1,"price":1230}]}}}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"123 Main St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"selectedProfile":{"uuid":"profile-1","name":"Personal","defaultPaymentProfileUuid":"payment-1"}}}`), nil
+				case "/_p/api/checkoutOrdersByDraftOrdersV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"orders":[],"validationErrors":[{"code":"card_declined"}]}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	_, err := client.CheckoutCart(context.Background(), "draft-1")
+	if err == nil || !strings.Contains(err.Error(), "validation errors") {
+		t.Fatalf("unexpected err=%v", err)
+	}
+}
+
+func TestClientCheckoutCart_UsesCartPaymentProfileWhenProfileLookupFails(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"Cafe","tagline1":{"text":"Subtotal: €12.30"},"tagline2":{"text":"Deliver to 123 Main St"},"itemCount":1,"action":"OPEN_CHECKOUT"}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"uuid":"draft-1","state":"UNORDERED","storeUuid":"store-1","deliveryType":"ASAP","interactionType":"leave_at_door","paymentProfileUUID":"payment-cart","deliveryAddress":{"fullAddress":"123 Main St"},"shoppingCart":{"cartUuid":"cart-1","currencyCode":"EUR","isActive":true,"items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","title":"Latte","quantity":1,"price":1230}]}}}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"123 Main St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 500, `{"status":"failure"}`), nil
+				case "/_p/api/checkoutOrdersByDraftOrdersV1":
+					rawBody, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("read checkout confirm body: %v", err)
+					}
+					var payload map[string]any
+					if err := json.Unmarshal(rawBody, &payload); err != nil {
+						t.Fatalf("unmarshal checkout confirm body: %v body=%s", err, string(rawBody))
+					}
+					if payload["paymentProfileUuid"] != "payment-cart" {
+						t.Fatalf("payload=%v", payload)
+					}
+					return jsonResponse(t, 200, `{"status":"success","data":{"orders":[{"uuid":"order-1","orderInfo":{"storeInfo":{"name":"Cafe"}},"activeOrderOverview":{"subtitle":"1 item for €16.80","items":[{"title":"Latte","quantity":1}]},"status":"ACTIVE"}]}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	result, err := client.CheckoutCart(context.Background(), "draft-1")
+	if err != nil {
+		t.Fatalf("CheckoutCart: %v", err)
+	}
+	if result.Order.Total != "€16.80" {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestExtractMoneyString_PreservesNonUSDCurrency(t *testing.T) {
+	if got := extractMoneyString("1 item for €16.80"); got != "€16.80" {
+		t.Fatalf("got=%q", got)
+	}
+}
+
 func TestClientDiscardCart_ErrorsWhenDraftWasNotDiscarded(t *testing.T) {
 	client := &Client{
 		BaseURL:      "https://www.ubereats.com",

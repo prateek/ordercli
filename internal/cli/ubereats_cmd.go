@@ -228,6 +228,7 @@ func newUberEatsCartsCmd(st *state) *cobra.Command {
 	cmd.AddCommand(newUberEatsCartsShowCmd(st))
 	cmd.AddCommand(newUberEatsCartsCreateCmd(st))
 	cmd.AddCommand(newUberEatsCartsUpdateCmd(st))
+	cmd.AddCommand(newUberEatsCartsCheckoutCmd(st))
 	cmd.AddCommand(newUberEatsCartsDiscardCmd(st))
 	cmd.AddCommand(newUberEatsCartItemsCmd(st))
 	return cmd
@@ -338,6 +339,34 @@ func newUberEatsCartsUpdateCmd(st *state) *cobra.Command {
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
 	cmd.Flags().StringVar(&deliveryType, "delivery-type", "", "delivery type (regular or premium)")
 	cmd.Flags().StringVar(&interactionType, "interaction-type", "", "interaction type")
+	return cmd
+}
+
+func newUberEatsCartsCheckoutCmd(st *state) *cobra.Command {
+	var asJSON bool
+	var confirm bool
+	cmd := &cobra.Command{
+		Use:   "checkout <cart-ref>",
+		Short: "Preview or place one Uber Eats draft cart checkout",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			if confirm {
+				result, err := client.CheckoutCart(cmd.Context(), args[0])
+				if err != nil {
+					return err
+				}
+				return writeUberEatsCheckoutResult(cmd.OutOrStdout(), result, asJSON)
+			}
+			preview, err := client.GetCheckoutPreview(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			return writeUberEatsCheckoutPreview(cmd.OutOrStdout(), preview, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().BoolVar(&confirm, "confirm", false, "place the order")
 	return cmd
 }
 
@@ -1028,6 +1057,94 @@ func writeUberEatsCartMutation(w io.Writer, result ubereats.CartMutation, asJSON
 		return writeUberEatsCart(w, *result.Cart, false)
 	}
 	return nil
+}
+
+func writeUberEatsCheckoutPreview(w io.Writer, preview ubereats.CheckoutPreview, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"item": preview,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	lines := []string{"ref=" + preview.Ref}
+	appendLine := func(key, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		lines = append(lines, key+"="+value)
+	}
+	appendLine("merchant", preview.Cart.StoreTitle)
+	appendLine("delivery_address", preview.Cart.Address)
+	appendLine("location_source", preview.Cart.SessionInfo.LocationSource)
+	appendLine("location_ref", preview.Cart.SessionInfo.LocationRef)
+	appendLine("location", preview.Cart.SessionInfo.Location)
+	appendLine("profile", preview.Cart.SessionInfo.Profile)
+	paymentProfileRef := preview.Cart.PaymentProfileRef
+	if paymentProfileRef == "" {
+		paymentProfileRef = preview.Cart.SessionInfo.PaymentProfileRef
+	}
+	subtotal := strings.TrimSpace(preview.Subtotal)
+	if subtotal == "" {
+		subtotal = preview.Cart.Subtotal
+	}
+	total := strings.TrimSpace(preview.Total)
+	if total == "" {
+		total = preview.Cart.Total
+	}
+	appendLine("payment_profile_ref", paymentProfileRef)
+	appendLine("subtotal", subtotal)
+	appendLine("total", total)
+	appendLine("fees", preview.Fees)
+	appendLine("taxes", preview.Taxes)
+	appendLine("tip", preview.Tip)
+	appendLine("eta", preview.ETA)
+	appendLine("delivery_type", preview.Cart.DeliveryType)
+	appendLine("interaction_type", preview.Cart.InteractionType)
+	appendLine("checkout_ready", fmt.Sprintf("%t", preview.Cart.CheckoutReady))
+	if len(preview.Cart.Items) > 0 {
+		lines = append(lines, "items:")
+		for _, item := range preview.Cart.Items {
+			lines = append(lines, "  "+formatUberEatsCartItem(item))
+		}
+	}
+	if len(preview.ValidationErrors) > 0 {
+		lines = append(lines, "validation_errors="+strings.Join(preview.ValidationErrors, ", "))
+	}
+	_, err := fmt.Fprintln(w, strings.Join(lines, "\n"))
+	return err
+}
+
+func writeUberEatsCheckoutResult(w io.Writer, result ubereats.CheckoutResult, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"item": result,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	lines := []string{"ref=" + result.Ref}
+	if details := strings.TrimSpace(result.Order.DetailsString()); details != "" {
+		lines = append(lines, details)
+	}
+	if url := strings.TrimSpace(result.PaymentProviderConfirmationURL); url != "" {
+		lines = append(lines, "payment_provider_confirmation_url="+url)
+	}
+	_, err := fmt.Fprintln(w, strings.Join(lines, "\n"))
+	return err
 }
 
 func writeUberEatsStore(w io.Writer, store ubereats.Store, asJSON bool) error {

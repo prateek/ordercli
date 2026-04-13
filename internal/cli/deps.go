@@ -65,6 +65,8 @@ type uberEatsClient interface {
 	AddCartItem(context.Context, string, string, int, string) (ubereats.CartMutation, error)
 	UpdateCartItem(context.Context, string, string, ubereats.CartItemUpdate) (ubereats.CartMutation, error)
 	UpdateCart(context.Context, string, ubereats.CartUpdate) (ubereats.CartMutation, error)
+	GetCheckoutPreview(context.Context, string) (ubereats.CheckoutPreview, error)
+	CheckoutCart(context.Context, string) (ubereats.CheckoutResult, error)
 	RemoveCartItem(context.Context, string, string) (ubereats.CartMutation, error)
 	DiscardCart(context.Context, string) (ubereats.CartMutation, error)
 	ListStores(context.Context, bool, int) ([]ubereats.Store, error)

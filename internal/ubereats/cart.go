@@ -54,6 +54,24 @@ type CartUpdate struct {
 	InteractionType string `json:"interaction_type,omitempty"`
 }
 
+type CheckoutPreview struct {
+	Ref              string   `json:"ref,omitempty"`
+	Cart             Cart     `json:"cart"`
+	Subtotal         string   `json:"subtotal,omitempty"`
+	Total            string   `json:"total,omitempty"`
+	Fees             string   `json:"fees,omitempty"`
+	Taxes            string   `json:"taxes,omitempty"`
+	Tip              string   `json:"tip,omitempty"`
+	ETA              string   `json:"eta,omitempty"`
+	ValidationErrors []string `json:"validation_errors,omitempty"`
+}
+
+type CheckoutResult struct {
+	Ref                            string `json:"ref,omitempty"`
+	Order                          Order  `json:"order"`
+	PaymentProviderConfirmationURL string `json:"payment_provider_confirmation_url,omitempty"`
+}
+
 type CartMutation struct {
 	Ref       string `json:"ref,omitempty"`
 	Added     bool   `json:"added,omitempty"`
@@ -74,6 +92,18 @@ type orderSeed struct {
 	StoreRef     string
 	CurrencyCode string
 	Items        []map[string]any
+}
+
+var checkoutPreviewPayloadTypes = []string{
+	"cartItems",
+	"subtotal",
+	"total",
+	"fareBreakdown",
+	"deliveryOptInInfo",
+	"eta",
+	"orderConfirmations",
+	"paymentProfilesEligibility",
+	"locationInfo",
 }
 
 func (c *Client) ListCarts(ctx context.Context, limit int) ([]Cart, error) {
@@ -146,12 +176,12 @@ func (c *Client) AddCartItem(ctx context.Context, ref, itemRef string, quantity 
 	}
 	line := cartLineFromMenuItem(item, quantity, note)
 	parsed, err := c.post(ctx, c.ordersURL(), c.endpointURL("addItemsToDraftOrderV2"), map[string]any{
-		"draftOrderUUID":               detail.Ref,
-		"cartUUID":                     detail.CartRef,
-		"items":                        []any{line},
+		"draftOrderUUID":                 detail.Ref,
+		"cartUUID":                       detail.CartRef,
+		"items":                          []any{line},
 		"shouldUpdateDraftOrderMetadata": false,
-		"storeUUID":                    detail.StoreRef,
-		"actionMeta":                   map[string]any{"isQuickAdd": false, "numClicks": 1},
+		"storeUUID":                      detail.StoreRef,
+		"actionMeta":                     map[string]any{"isQuickAdd": false, "numClicks": 1},
 	}, c.locationHeaders(location))
 	if err != nil {
 		return CartMutation{}, err
@@ -274,6 +304,71 @@ func (c *Client) UpdateCart(ctx context.Context, ref string, update CartUpdate) 
 		return CartMutation{}, err
 	}
 	return CartMutation{Ref: updatedCart.Ref, Updated: true, Cart: &updatedCart}, nil
+}
+
+func (c *Client) GetCheckoutPreview(ctx context.Context, ref string) (CheckoutPreview, error) {
+	cart, err := c.GetCart(ctx, ref)
+	if err != nil {
+		return CheckoutPreview{}, err
+	}
+	payloadTypes := make([]any, 0, len(checkoutPreviewPayloadTypes))
+	for _, payloadType := range checkoutPreviewPayloadTypes {
+		payloadTypes = append(payloadTypes, payloadType)
+	}
+	parsed, err := c.post(ctx, c.ordersURL(), c.endpointURL("getCheckoutPresentationV1"), map[string]any{
+		"payloadTypes":                     payloadTypes,
+		"draftOrderUUID":                   cart.Ref,
+		"isGroupOrder":                     false,
+		"clientFeaturesData":               map[string]any{"paymentSelectionContext": map[string]any{"value": `{"deviceContext":{"thirdPartyApplications":["google_pay","venmo"]}}`}},
+		"webGiftingPersonalizationEnabled": false,
+	}, nil)
+	if err != nil {
+		return CheckoutPreview{}, err
+	}
+	return checkoutPreviewFromParsed(cart, parsed), nil
+}
+
+func (c *Client) CheckoutCart(ctx context.Context, ref string) (CheckoutResult, error) {
+	cart, err := c.GetCart(ctx, ref)
+	if err != nil {
+		return CheckoutResult{}, err
+	}
+	paymentProfileRef := cart.PaymentProfileRef
+	if paymentProfileRef == "" {
+		_, paymentProfileRef, err = c.selectedProfileContext(ctx)
+		if err != nil {
+			return CheckoutResult{}, err
+		}
+	}
+	detail, err := c.resolveCartDetail(ctx, cart.Ref)
+	if err != nil {
+		return CheckoutResult{}, err
+	}
+	payload := map[string]any{
+		"draftOrderUUID":         cart.Ref,
+		"storeInstructions":      "",
+		"extraPaymentData":       "",
+		"shareCPFWithRestaurant": false,
+		"extraParams":            map[string]any{"timezone": localTimezoneName()},
+	}
+	if detail.StoreRef != "" {
+		payload["storeUuid"] = detail.StoreRef
+	}
+	if paymentProfileRef != "" {
+		payload["paymentProfileUuid"] = paymentProfileRef
+	}
+	parsed, err := c.post(ctx, c.ordersURL(), c.endpointURL("checkoutOrdersByDraftOrdersV1"), payload, nil)
+	if err != nil {
+		return CheckoutResult{}, err
+	}
+	if validationErrors := checkoutValidationErrors(nestedMapValue(parsed, "data")["validationErrors"]); len(validationErrors) > 0 {
+		return CheckoutResult{}, fmt.Errorf("ubereats: checkoutOrdersByDraftOrdersV1 returned validation errors: %s", strings.Join(validationErrors, ", "))
+	}
+	result := checkoutResultFromParsed(cart, parsed, c.BaseURL)
+	if result.Order.UUID == "" && result.PaymentProviderConfirmationURL == "" {
+		return CheckoutResult{}, fmt.Errorf("ubereats: checkoutOrdersByDraftOrdersV1 did not return an order")
+	}
+	return result, nil
 }
 
 func (c *Client) createCart(ctx context.Context, storeRef string, items []map[string]any, currencyCode string) (Cart, error) {
@@ -630,8 +725,8 @@ func createDraftOrderPayload(items []map[string]any, currencyCode, paymentProfil
 		shoppingCartItems = append(shoppingCartItems, item)
 	}
 	payload := map[string]any{
-		"isMulticart": true,
-		"shoppingCartItems": shoppingCartItems,
+		"isMulticart":          true,
+		"shoppingCartItems":    shoppingCartItems,
 		"useCredits":           true,
 		"extraPaymentProfiles": []any{},
 		"promotionOptions": map[string]any{
@@ -650,6 +745,44 @@ func createDraftOrderPayload(items []map[string]any, currencyCode, paymentProfil
 		"businessDetails":             map[string]any{},
 	}
 	return payload
+}
+
+func checkoutPreviewFromParsed(cart Cart, parsed map[string]any) CheckoutPreview {
+	data, _ := parsed["data"].(map[string]any)
+	payloads := nestedMapValue(data, "checkoutPayloads")
+	preview := CheckoutPreview{
+		Ref:              cart.Ref,
+		Cart:             cart,
+		Subtotal:         firstNonEmpty(checkoutSubtotalDisplay(payloads), cart.Subtotal),
+		Total:            firstNonEmpty(checkoutTotalDisplay(payloads), cart.Total),
+		Fees:             checkoutFeesDisplay(payloads, cart.CurrencyCode),
+		Taxes:            checkoutTaxesDisplay(payloads, cart.CurrencyCode),
+		Tip:              checkoutTipDisplay(payloads, cart.CurrencyCode),
+		ETA:              firstStringValue(nestedMapValue(payloads, "eta"), "rangeText"),
+		ValidationErrors: checkoutValidationErrors(data["validationErrors"]),
+	}
+	return preview
+}
+
+func checkoutResultFromParsed(cart Cart, parsed map[string]any, baseURL string) CheckoutResult {
+	data, _ := parsed["data"].(map[string]any)
+	result := CheckoutResult{
+		Ref:                            cart.Ref,
+		PaymentProviderConfirmationURL: firstStringValue(data, "paymentProviderConfirmationUrl"),
+	}
+	orderMaps := listOfMaps(data["orders"])
+	if len(orderMaps) == 0 {
+		return result
+	}
+	order := orderFromCheckoutMap(orderMaps[0], baseURL)
+	if order.SessionInfo == (SessionInfo{}) {
+		order.SessionInfo = cart.SessionInfo
+	}
+	if order.Total == "" {
+		order.Total = cart.Total
+	}
+	result.Order = order
+	return result
 }
 
 func updateDraftOrderPayload(detail cartDetail, location Location, selectedPaymentProfileRef string) map[string]any {
@@ -678,6 +811,200 @@ func updateDraftOrderPayload(detail cartDetail, location Location, selectedPayme
 		payload["diningMode"] = "DELIVERY"
 	}
 	return payload
+}
+
+func checkoutSubtotalDisplay(payloads map[string]any) string {
+	return firstStringValue(nestedMapValue(nestedMapValue(payloads, "subtotal"), "subtotal"), "formattedValue")
+}
+
+func checkoutTotalDisplay(payloads map[string]any) string {
+	return firstStringValue(nestedMapValue(nestedMapValue(payloads, "total"), "total"), "formattedValue")
+}
+
+func checkoutFeesDisplay(payloads map[string]any, currencyCode string) string {
+	feesMinor := 0
+	displays := make([]string, 0)
+	for _, charge := range checkoutCharges(payloads) {
+		title := strings.ToLower(firstStringValue(nestedMapValue(charge, "title"), "text"))
+		switch {
+		case strings.Contains(title, "subtotal"), strings.Contains(title, "tax"), strings.Contains(title, "tip"), strings.Contains(title, "total"):
+			continue
+		default:
+			feesMinor += checkoutChargeAmountMinor(charge)
+			if display := checkoutChargeDisplay(charge); display != "" {
+				displays = append(displays, display)
+			}
+		}
+	}
+	if feesMinor != 0 {
+		return minorCurrencyDisplay(feesMinor, currencyCode)
+	}
+	if len(displays) == 1 {
+		return displays[0]
+	}
+	if len(displays) > 1 {
+		return strings.Join(displays, " + ")
+	}
+	return ""
+}
+
+func checkoutTaxesDisplay(payloads map[string]any, currencyCode string) string {
+	taxesMinor := 0
+	displays := make([]string, 0)
+	for _, charge := range checkoutCharges(payloads) {
+		title := strings.ToLower(firstStringValue(nestedMapValue(charge, "title"), "text"))
+		if strings.Contains(title, "tax") {
+			taxesMinor += checkoutChargeAmountMinor(charge)
+			if display := checkoutChargeDisplay(charge); display != "" {
+				displays = append(displays, display)
+			}
+		}
+	}
+	if taxesMinor != 0 {
+		return minorCurrencyDisplay(taxesMinor, currencyCode)
+	}
+	if len(displays) == 1 {
+		return displays[0]
+	}
+	if len(displays) > 1 {
+		return strings.Join(displays, " + ")
+	}
+	return ""
+}
+
+func checkoutTipDisplay(payloads map[string]any, currencyCode string) string {
+	tipMinor := 0
+	foundTip := false
+	displays := make([]string, 0)
+	for _, charge := range checkoutCharges(payloads) {
+		title := strings.ToLower(firstStringValue(nestedMapValue(charge, "title"), "text"))
+		if strings.Contains(title, "tip") {
+			foundTip = true
+			tipMinor += checkoutChargeAmountMinor(charge)
+			if display := checkoutChargeDisplay(charge); display != "" {
+				displays = append(displays, display)
+			}
+		}
+	}
+	if tipMinor != 0 {
+		return minorCurrencyDisplay(tipMinor, currencyCode)
+	}
+	if len(displays) == 1 {
+		return displays[0]
+	}
+	if len(displays) > 1 {
+		return strings.Join(displays, " + ")
+	}
+	if foundTip {
+		return formatMoney(0, currencyCode)
+	}
+	return "not set"
+}
+
+func checkoutCharges(payloads map[string]any) []map[string]any {
+	return listOfMaps(nestedMapValue(payloads, "fareBreakdown")["charges"])
+}
+
+func checkoutChargeAmountMinor(charge map[string]any) int {
+	metadata := nestedMapValue(charge, "fareBreakdownChargeMetadata")
+	for _, info := range listOfMaps(metadata["analyticsInfo"]) {
+		currencyAmount := nestedMapValue(info, "currencyAmount")
+		if amountMinor := amountE5ToMinor(currencyAmount["amountE5"]); amountMinor != 0 {
+			return amountMinor
+		}
+	}
+	return 0
+}
+
+func checkoutChargeDisplay(charge map[string]any) string {
+	return firstStringValue(nestedMapValue(charge, "value"), "text", "accessibilityText")
+}
+
+func amountE5ToMinor(v any) int {
+	switch typed := v.(type) {
+	case float64, int, int64:
+		return intValue(typed) / 1000
+	case map[string]any:
+		raw := firstNonZeroInt(intValue(typed["low"]), intValue(typed["high"]))
+		if raw != 0 {
+			return raw / 1000
+		}
+	}
+	return 0
+}
+
+func checkoutValidationErrors(v any) []string {
+	if values := stringList(v); len(values) > 0 {
+		return values
+	}
+	errors := make([]string, 0)
+	for _, item := range listOfMaps(v) {
+		value := firstNonEmpty(
+			firstStringValue(item, "message", "text", "title", "code"),
+			nestedNamedValue(item, "message", "text"),
+		)
+		if value == "" {
+			continue
+		}
+		errors = append(errors, value)
+	}
+	return errors
+}
+
+func orderFromCheckoutMap(m map[string]any, baseURL string) Order {
+	order, _ := orderFromMap(m, baseURL)
+	order.UUID = firstNonEmpty(order.UUID, firstStringValue(m, "uuid", "orderUuid"))
+	order.Merchant = firstNonEmpty(
+		order.Merchant,
+		firstStringValue(nestedMapValue(nestedMapValue(m, "orderInfo"), "storeInfo"), "name", "title"),
+		firstStringValue(nestedMapValue(m, "activeOrderOverview"), "title"),
+	)
+	order.Status = firstNonEmpty(
+		order.Status,
+		humanizeStatusCode(firstStringValue(nestedMapValue(m, "orderInfo"), "orderPhase")),
+		humanizeStatusCode(firstStringValue(m, "status")),
+	)
+	order.Total = firstNonEmpty(order.Total, extractMoneyString(firstStringValue(nestedMapValue(m, "activeOrderOverview"), "subtitle")))
+	if len(order.Items) == 0 {
+		order.Items = checkoutOverviewItems(nestedMapValue(m, "activeOrderOverview")["items"])
+	}
+	if order.URL == "" && order.UUID != "" {
+		if builtURL, err := BuildOrderURL(baseURL, order.UUID); err == nil {
+			order.URL = builtURL
+		}
+	}
+	return order
+}
+
+func checkoutOverviewItems(v any) []string {
+	items := make([]string, 0)
+	for _, row := range listOfMaps(v) {
+		title := firstStringValue(row, "title")
+		if title == "" {
+			continue
+		}
+		quantity := firstNonZeroInt(intValue(row["quantity"]), 1)
+		items = append(items, fmt.Sprintf("%dx %s", quantity, title))
+	}
+	return items
+}
+
+func extractMoneyString(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	fields := strings.Fields(value)
+	for i := len(fields) - 1; i >= 0; i-- {
+		token := strings.Trim(strings.TrimSpace(fields[i]), ",.;:)")
+		if token == "" || !strings.ContainsAny(token, "0123456789") {
+			continue
+		}
+		if strings.ContainsAny(token, "$€£¥₩₹") || strings.Contains(token, ".") || strings.Contains(token, ",") {
+			return token
+		}
+	}
+	return ""
 }
 
 func findCartItemPayload(cart map[string]any, cartItemRef string) map[string]any {
