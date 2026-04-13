@@ -302,3 +302,178 @@ func TestClientSearchItems_FailsWhenDefaultLocationUnavailable(t *testing.T) {
 		t.Fatalf("expected SearchItems to fail when location lookup fails")
 	}
 }
+
+func TestClientSearchStores_UsesSearchFeed(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getSearchFeedV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"storesMap":{
+								"store-1":{"uuid":"store-1","title":"CVS","isOrderable":true,"isFavorite":true,"rating":4.7,"etaRange":{"min":15,"max":25},"fareInfo":{"serviceFee":0},"currencyCode":"USD"},
+								"store-2":{"uuid":"store-2","title":"Walgreens","isOrderable":false,"isFavorite":false,"rating":4.3,"etaRange":{"min":20,"max":35},"fareInfo":{"serviceFee":199},"currencyCode":"USD"}
+							},
+							"feedItems":[
+								{"type":"MINI_STORE","storeUuid":"store-1"},
+								{"type":"MINI_STORE_WITH_ITEMS","storeUuid":"store-2"}
+							]
+						}
+					}`), nil
+				default:
+					t.Fatalf("unexpected path %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	stores, err := client.SearchStores(context.Background(), "pharmacy", 10)
+	if err != nil {
+		t.Fatalf("SearchStores: %v", err)
+	}
+	if len(stores) != 2 {
+		t.Fatalf("stores=%+v", stores)
+	}
+	if stores[0].Ref != "store-1" || stores[0].Title != "CVS" {
+		t.Fatalf("store[0]=%+v", stores[0])
+	}
+	if stores[1].Ref != "store-2" || stores[1].Orderable {
+		t.Fatalf("store[1]=%+v", stores[1])
+	}
+}
+
+func TestClientSearchStores_ParsesNestedFeedStoreCards(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getSearchFeedV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"feedItems":[
+								{"type":"SECTION_HEADER","uuid":"header-1","title":{"text":"Top result"}},
+								{"type":"REGULAR_STORE","store":{
+									"storeUuid":"store-1",
+									"title":{"text":"CVS (150 East 42Nd St.)"},
+									"favorite":false,
+									"rating":{"text":"4.8"},
+									"meta":[{"badgeType":"ETD","text":"19 min"}],
+									"tracking":{"storePayload":{"isOrderable":true,"ratingInfo":{"ratingCount":"1,000+"},"fareInfo":{"actualServiceFee":{"low":0}}}}
+								}},
+								{"type":"CAROUSEL","carousel":{"stores":[
+									{
+										"storeUuid":"store-2",
+										"title":{"text":"Walgreens"},
+										"favorite":true,
+										"meta":[{"badgeType":"ETD","text":"22 min"}],
+										"tracking":{"storePayload":{"isOrderable":true,"ratingInfo":{"ratingCount":"900+"},"fareInfo":{"actualServiceFee":{"low":249}}}}
+									}
+								]}}
+							]
+						}
+					}`), nil
+				default:
+					t.Fatalf("unexpected path %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	stores, err := client.SearchStores(context.Background(), "pharmacy", 10)
+	if err != nil {
+		t.Fatalf("SearchStores: %v", err)
+	}
+	if len(stores) != 2 {
+		t.Fatalf("stores=%+v", stores)
+	}
+	if stores[0].Ref != "store-1" || stores[0].Title != "CVS (150 East 42Nd St.)" || !stores[0].Orderable {
+		t.Fatalf("store[0]=%+v", stores[0])
+	}
+	if stores[1].Ref != "store-2" || !stores[1].Favorite || stores[1].FeeDisplay == "" {
+		t.Fatalf("store[1]=%+v", stores[1])
+	}
+}
+
+func TestClientListStores_FiltersFavorites(t *testing.T) {
+	var requestBodies []map[string]any
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getFeedV1":
+					rawBody, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("read body: %v", err)
+					}
+					var payload map[string]any
+					if len(rawBody) > 0 {
+						if err := json.Unmarshal(rawBody, &payload); err != nil {
+							t.Fatalf("unmarshal body: %v body=%s", err, string(rawBody))
+						}
+					}
+					requestBodies = append(requestBodies, payload)
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"favorites":{"store-2":{}},
+							"feedItems":[
+								{"type":"REGULAR_STORE","store":{"storeUuid":"store-1","title":{"text":"CVS"},"favorite":false,"tracking":{"storePayload":{"isOrderable":true}}}},
+								{"type":"FEATURED_STORES","carousel":{"stores":[
+									{"storeUuid":"store-2","title":"Walgreens","favorite":false,"trackingCode":{"storePayload":{"isOrderable":true,"ratingInfo":{"ratingCount":"900+"},"fareInfo":{"actualServiceFee":{"low":249}}}}}
+								]}}
+							]
+						}
+					}`), nil
+				default:
+					t.Fatalf("unexpected path %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	stores, err := client.ListStores(context.Background(), false, 10)
+	if err != nil {
+		t.Fatalf("ListStores: %v", err)
+	}
+	if len(stores) != 2 {
+		t.Fatalf("stores=%+v", stores)
+	}
+	if !stores[1].Favorite {
+		t.Fatalf("expected favorites map to mark Walgreens as favorite, got %+v", stores[1])
+	}
+
+	favorites, err := client.ListStores(context.Background(), true, 10)
+	if err != nil {
+		t.Fatalf("ListStores favorites: %v", err)
+	}
+	if len(favorites) != 1 || favorites[0].Ref != "store-2" || !favorites[0].Favorite {
+		t.Fatalf("favorites=%+v", favorites)
+	}
+	if len(requestBodies) != 2 {
+		t.Fatalf("requestBodies=%v", requestBodies)
+	}
+	if len(requestBodies[0]) != 0 {
+		t.Fatalf("default payload=%v", requestBodies[0])
+	}
+	if got, ok := requestBodies[1]["storeFilters"].([]any); !ok || len(got) != 1 || got[0] != "FAVORITES" {
+		t.Fatalf("favorites payload=%v", requestBodies[1])
+	}
+}

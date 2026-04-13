@@ -3,6 +3,7 @@ package ubereats
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -70,6 +71,55 @@ func (c *Client) GetStore(ctx context.Context, ref string) (Store, error) {
 		return Store{}, err
 	}
 	return normalizeStore(data), nil
+}
+
+func (c *Client) ListStores(ctx context.Context, favoritesOnly bool, limit int) ([]Store, error) {
+	location, err := c.effectiveLocation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	payload := map[string]any{}
+	if favoritesOnly {
+		payload["storeFilters"] = []string{"FAVORITES"}
+	}
+	parsed, err := c.post(ctx, c.BaseURL+"/", c.endpointURL("getFeedV1")+"?localeCode=en-US", payload, c.locationHeaders(location))
+	if err != nil {
+		return nil, err
+	}
+	data, _ := parsed["data"].(map[string]any)
+	stores := discoveryStores(data)
+	favoriteRefs := favoriteRefsFromValue(data["favorites"])
+	stores = markFavoriteStores(stores, favoriteRefs)
+	if favoritesOnly {
+		stores = filterFavoriteStores(stores, nil)
+	}
+	return limitStores(stores, limit), nil
+}
+
+func (c *Client) SearchStores(ctx context.Context, query string, limit int) ([]Store, error) {
+	location, err := c.effectiveLocation(ctx)
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := c.post(ctx, c.ordersURL(), c.endpointURL("getSearchFeedV1"), map[string]any{
+		"userQuery":      strings.TrimSpace(query),
+		"date":           "",
+		"startTime":      0,
+		"endTime":        0,
+		"sortAndFilters": []any{},
+		"vertical":       "ALL",
+		"searchSource":   "SEARCH_SUGGESTION",
+		"displayType":    "SEARCH_RESULTS",
+		"searchType":     "GLOBAL_SEARCH",
+		"keyName":        "",
+		"cacheKey":       "",
+		"recaptchaToken": "",
+	}, c.locationHeaders(location))
+	if err != nil {
+		return nil, err
+	}
+	data, _ := parsed["data"].(map[string]any)
+	return limitStores(discoveryStores(data), limit), nil
 }
 
 func (c *Client) GetStoreMenu(ctx context.Context, ref string) (StoreMenu, error) {
@@ -319,6 +369,61 @@ func normalizeStore(data map[string]any) Store {
 	}
 }
 
+func normalizeDiscoveryStore(data map[string]any, fallbackRef string) Store {
+	tracking, _ := data["tracking"].(map[string]any)
+	if len(tracking) == 0 {
+		tracking, _ = data["trackingCode"].(map[string]any)
+	}
+	storePayload, _ := tracking["storePayload"].(map[string]any)
+	currency := firstNonEmpty(firstStringValue(data, "currencyCode"), firstStringValue(storePayload, "currencyCode"))
+	eta := firstMetaText(data["meta"], "ETD")
+	if eta == "" {
+		eta = etaDisplay(nestedMapValue(data, "etaRange"))
+	}
+	if eta == "" {
+		etdInfo, _ := storePayload["etdInfo"].(map[string]any)
+		dropoffRange, _ := etdInfo["dropoffETARange"].(map[string]any)
+		eta = etaDisplay(dropoffRange)
+	}
+	feeDisplay := firstNonEmpty(
+		firstStringValue(data, "fareDisplay"),
+		firstMetaText(data["meta"], "MembershipBenefit"),
+		firstMetaText(data["meta"], "DELIVERY_FEE"),
+		nestedNamedValue(data, "fareBadge", "text"),
+		minorCurrencyDisplay(intValue(nestedMapValue(data, "fareInfo")["serviceFee"]), currency),
+	)
+	if feeDisplay == "" {
+		fareInfo, _ := storePayload["fareInfo"].(map[string]any)
+		actual, _ := fareInfo["actualServiceFee"].(map[string]any)
+		feeDisplay = minorCurrencyDisplay(firstNonZeroInt(intValue(actual["low"]), intValue(actual["high"])), currency)
+	}
+	rating := floatValue(data["rating"])
+	if rating == 0 {
+		if ratingMap, ok := data["rating"].(map[string]any); ok {
+			rating = parseDisplayFloat(firstStringValue(ratingMap, "text"))
+		}
+	}
+	if rating == 0 {
+		ratingInfo, _ := storePayload["ratingInfo"].(map[string]any)
+		rating = floatValue(ratingInfo["storeRatingScore"])
+	}
+	ratingCount := firstNonEmpty(
+		firstStringValue(data, "ratingCount"),
+		nestedNamedValue(storePayload, "ratingInfo", "ratingCount"),
+	)
+	return Store{
+		Ref:          firstNonEmpty(firstStringValue(data, "storeUuid", "uuid"), fallbackRef),
+		Title:        firstNonEmpty(firstStringValue(data, "title"), nestedNamedValue(data, "title", "text")),
+		CurrencyCode: currency,
+		Orderable:    boolValue(data["isOrderable"]) || boolValue(storePayload["isOrderable"]),
+		Favorite:     boolValue(data["isFavorite"]) || boolValue(data["favorite"]),
+		Rating:       rating,
+		RatingCount:  ratingCount,
+		ETADisplay:   eta,
+		FeeDisplay:   feeDisplay,
+	}
+}
+
 func normalizeCatalogItems(raw any, store Store) []StoreItem {
 	rows, _ := raw.([]any)
 	items := make([]StoreItem, 0)
@@ -477,4 +582,175 @@ func storeUUIDFromFeedItem(m map[string]any) string {
 	}
 	payload, _ := m["payload"].(map[string]any)
 	return firstStringValue(payload, "storeUuid", "uuid")
+}
+
+func storeUUIDFromFeedItemMap(v any) string {
+	switch typed := v.(type) {
+	case map[string]any:
+		if value := storeUUIDFromFeedItem(typed); value != "" {
+			return value
+		}
+		for _, child := range typed {
+			if value := storeUUIDFromFeedItemMap(child); value != "" {
+				return value
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if value := storeUUIDFromFeedItemMap(child); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func storesFromMap(storesMap map[string]any) []Store {
+	out := make([]Store, 0, len(storesMap))
+	for key, raw := range storesMap {
+		storeInfo, _ := raw.(map[string]any)
+		store := normalizeDiscoveryStore(storeInfo, key)
+		if store.Ref == "" || store.Title == "" {
+			continue
+		}
+		out = append(out, store)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Title == out[j].Title {
+			return out[i].Ref < out[j].Ref
+		}
+		return out[i].Title < out[j].Title
+	})
+	return out
+}
+
+func discoveryStores(data map[string]any) []Store {
+	seen := map[string]struct{}{}
+	out := make([]Store, 0)
+	appendStore := func(store Store) {
+		if store.Ref == "" || store.Title == "" {
+			return
+		}
+		if _, ok := seen[store.Ref]; ok {
+			return
+		}
+		seen[store.Ref] = struct{}{}
+		out = append(out, store)
+	}
+	for _, rawStore := range extractDiscoveryStoreMaps(data["feedItems"]) {
+		store := normalizeDiscoveryStore(rawStore, "")
+		appendStore(store)
+	}
+	if storesMap, ok := data["storesMap"].(map[string]any); ok {
+		for _, store := range storesFromMap(storesMap) {
+			appendStore(store)
+		}
+	}
+	return out
+}
+
+func extractDiscoveryStoreMaps(v any) []map[string]any {
+	out := make([]map[string]any, 0)
+	switch typed := v.(type) {
+	case map[string]any:
+		if store, ok := typed["store"].(map[string]any); ok {
+			out = append(out, store)
+		}
+		if carousel, ok := typed["carousel"].(map[string]any); ok {
+			out = append(out, extractDiscoveryStoreMaps(carousel["stores"])...)
+		}
+		if looksLikeDiscoveryStore(typed) {
+			out = append(out, typed)
+		}
+		for _, child := range typed {
+			out = append(out, extractDiscoveryStoreMaps(child)...)
+		}
+	case []any:
+		for _, child := range typed {
+			out = append(out, extractDiscoveryStoreMaps(child)...)
+		}
+	}
+	return out
+}
+
+func looksLikeDiscoveryStore(data map[string]any) bool {
+	if firstStringValue(data, "storeUuid") == "" {
+		return false
+	}
+	if firstNonEmpty(firstStringValue(data, "title"), nestedNamedValue(data, "title", "text")) == "" {
+		return false
+	}
+	return true
+}
+
+func favoriteRefsFromValue(v any) map[string]struct{} {
+	out := map[string]struct{}{}
+	if typed, ok := v.(map[string]any); ok {
+		for key := range typed {
+			if strings.TrimSpace(key) != "" {
+				out[key] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+func filterFavoriteStores(stores []Store, favoriteRefs map[string]struct{}) []Store {
+	if len(favoriteRefs) != 0 {
+		stores = markFavoriteStores(stores, favoriteRefs)
+	}
+	out := make([]Store, 0, len(stores))
+	for _, store := range stores {
+		if store.Favorite {
+			out = append(out, store)
+		}
+	}
+	return out
+}
+
+func markFavoriteStores(stores []Store, favoriteRefs map[string]struct{}) []Store {
+	if len(favoriteRefs) == 0 {
+		return stores
+	}
+	out := make([]Store, len(stores))
+	copy(out, stores)
+	for i := range out {
+		if _, ok := favoriteRefs[out[i].Ref]; ok {
+			out[i].Favorite = true
+		}
+	}
+	return out
+}
+
+func limitStores(stores []Store, limit int) []Store {
+	if limit <= 0 || len(stores) <= limit {
+		return stores
+	}
+	return stores[:limit]
+}
+
+func firstMetaText(v any, badgeType string) string {
+	rows, _ := v.([]any)
+	for _, raw := range rows {
+		row, _ := raw.(map[string]any)
+		if !strings.EqualFold(firstStringValue(row, "badgeType"), badgeType) {
+			continue
+		}
+		if text := firstStringValue(row, "text"); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func parseDisplayFloat(v string) float64 {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	var parsed float64
+	if _, err := fmt.Sscanf(v, "%f", &parsed); err != nil {
+		return 0
+	}
+	return parsed
 }

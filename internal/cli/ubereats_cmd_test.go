@@ -20,6 +20,7 @@ type fakeUberEatsClient struct {
 	listLocations         func(context.Context) ([]ubereats.Location, error)
 	defaultLocation       func(context.Context) (ubereats.Location, error)
 	getInstructionContext func(context.Context, ubereats.Location) (ubereats.InstructionContext, error)
+	listStores            func(context.Context, bool, int) ([]ubereats.Store, error)
 	getStore              func(context.Context, string) (ubereats.Store, error)
 	getStoreMenu          func(context.Context, string) (ubereats.StoreMenu, error)
 	searchStores          func(context.Context, string, int) ([]ubereats.Store, error)
@@ -52,6 +53,10 @@ func (f fakeUberEatsClient) DefaultLocation(ctx context.Context) (ubereats.Locat
 
 func (f fakeUberEatsClient) GetInstructionContext(ctx context.Context, location ubereats.Location) (ubereats.InstructionContext, error) {
 	return f.getInstructionContext(ctx, location)
+}
+
+func (f fakeUberEatsClient) ListStores(ctx context.Context, favoritesOnly bool, limit int) ([]ubereats.Store, error) {
+	return f.listStores(ctx, favoritesOnly, limit)
 }
 
 func (f fakeUberEatsClient) GetStore(ctx context.Context, ref string) (ubereats.Store, error) {
@@ -543,6 +548,55 @@ func TestUberEatsCLI_StoreSearch(t *testing.T) {
 	}
 	if !strings.Contains(out, `"ref": "store-1"`) || !strings.Contains(out, `"items"`) {
 		t.Fatalf("unexpected stores search --json out=%s", out)
+	}
+}
+
+func TestUberEatsCLI_StoreList(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	oldFactory := uberEatsClientFactory
+	t.Cleanup(func() { uberEatsClientFactory = oldFactory })
+	uberEatsClientFactory = func(st *state, _ uberEatsCommand) uberEatsClient {
+		return fakeUberEatsClient{
+			listStores: func(_ context.Context, favoritesOnly bool, limit int) ([]ubereats.Store, error) {
+				if limit != 20 {
+					t.Fatalf("limit=%d", limit)
+				}
+				if favoritesOnly {
+					return []ubereats.Store{{
+						Ref:          "store-2",
+						Title:        "Walgreens",
+						CurrencyCode: "USD",
+						Orderable:    true,
+						Favorite:     true,
+						ETADisplay:   "22 min",
+					}}, nil
+				}
+				return []ubereats.Store{{
+					Ref:          "store-1",
+					Title:        "CVS",
+					CurrencyCode: "USD",
+					Orderable:    true,
+					Favorite:     false,
+					ETADisplay:   "19 min",
+				}}, nil
+			},
+		}
+	}
+
+	out, _, err := runCLI(cfgPath, []string{"ubereats", "stores", "list"}, "")
+	if err != nil {
+		t.Fatalf("stores list: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "ref=store-1") || !strings.Contains(out, "title=CVS") {
+		t.Fatalf("unexpected stores list out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "stores", "list", "--filter", "favorites", "--json"}, "")
+	if err != nil {
+		t.Fatalf("stores list favorites: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, `"ref": "store-2"`) || !strings.Contains(out, `"favorite": true`) {
+		t.Fatalf("unexpected stores list favorites out=%s", out)
 	}
 }
 

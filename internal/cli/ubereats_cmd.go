@@ -274,9 +274,36 @@ func newUberEatsStoresCmd(st *state) *cobra.Command {
 		Use:   "stores",
 		Short: "Inspect Uber Eats stores",
 	}
+	cmd.AddCommand(newUberEatsStoresListCmd(st))
 	cmd.AddCommand(newUberEatsStoresSearchCmd(st))
 	cmd.AddCommand(newUberEatsStoresShowCmd(st))
 	cmd.AddCommand(newUberEatsStoresMenuCmd(st))
+	return cmd
+}
+
+func newUberEatsStoresListCmd(st *state) *cobra.Command {
+	var asJSON bool
+	var filter string
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List Uber Eats stores",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			favoritesOnly := strings.EqualFold(strings.TrimSpace(filter), "favorites")
+			if filter != "" && !favoritesOnly {
+				return fmt.Errorf("unsupported store filter %q", filter)
+			}
+			stores, err := client.ListStores(cmd.Context(), favoritesOnly, limit)
+			if err != nil {
+				return err
+			}
+			return writeUberEatsStores(cmd.OutOrStdout(), stores, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().StringVar(&filter, "filter", "", "favorites")
+	cmd.Flags().IntVar(&limit, "limit", 20, "max stores to return")
 	return cmd
 }
 
