@@ -22,6 +22,7 @@ type fakeUberEatsClient struct {
 	getInstructionContext func(context.Context, ubereats.Location) (ubereats.InstructionContext, error)
 	getStore              func(context.Context, string) (ubereats.Store, error)
 	getStoreMenu          func(context.Context, string) (ubereats.StoreMenu, error)
+	searchStores          func(context.Context, string, int) ([]ubereats.Store, error)
 	searchItems           func(context.Context, string, int) ([]ubereats.StoreItem, error)
 	searchStoreItems      func(context.Context, string, string, int) ([]ubereats.StoreItem, error)
 	getMenuItem           func(context.Context, string, string) (ubereats.ItemDetail, error)
@@ -59,6 +60,10 @@ func (f fakeUberEatsClient) GetStore(ctx context.Context, ref string) (ubereats.
 
 func (f fakeUberEatsClient) GetStoreMenu(ctx context.Context, ref string) (ubereats.StoreMenu, error) {
 	return f.getStoreMenu(ctx, ref)
+}
+
+func (f fakeUberEatsClient) SearchStores(ctx context.Context, query string, limit int) ([]ubereats.Store, error) {
+	return f.searchStores(ctx, query, limit)
 }
 
 func (f fakeUberEatsClient) SearchItems(ctx context.Context, query string, limit int) ([]ubereats.StoreItem, error) {
@@ -276,7 +281,7 @@ func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("history --json: %v out=%s", err, out)
 	}
-	if !strings.Contains(out, `"uuid": "past-1"`) || strings.Contains(out, `"ok": true`) {
+	if !strings.Contains(out, `"uuid": "past-1"`) || !strings.Contains(out, `"ok": true`) || !strings.Contains(out, `"items"`) {
 		t.Fatalf("unexpected history --json out=%s", out)
 	}
 
@@ -318,7 +323,7 @@ func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("order --json: %v out=%s", err, out)
 	}
-	if !strings.Contains(out, `"uuid": "past-1"`) || strings.Contains(out, `"ok": true`) {
+	if !strings.Contains(out, `"uuid": "past-1"`) || !strings.Contains(out, `"ok": true`) || !strings.Contains(out, `"item"`) {
 		t.Fatalf("unexpected order --json out=%s", out)
 	}
 
@@ -502,6 +507,45 @@ func TestUberEatsCLI_StoresAndItems(t *testing.T) {
 	}
 }
 
+func TestUberEatsCLI_StoreSearch(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	oldFactory := uberEatsClientFactory
+	t.Cleanup(func() { uberEatsClientFactory = oldFactory })
+	uberEatsClientFactory = func(st *state, _ uberEatsCommand) uberEatsClient {
+		return fakeUberEatsClient{
+			searchStores: func(context.Context, string, int) ([]ubereats.Store, error) {
+				return []ubereats.Store{
+					{
+						Ref:          "store-1",
+						Title:        "CVS",
+						CurrencyCode: "USD",
+						Orderable:    true,
+						Favorite:     true,
+						ETADisplay:   "15-25 min",
+						FeeDisplay:   "$0.00",
+					},
+				}, nil
+			},
+		}
+	}
+
+	out, _, err := runCLI(cfgPath, []string{"ubereats", "stores", "search", "pharmacy"}, "")
+	if err != nil {
+		t.Fatalf("stores search: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "ref=store-1") || !strings.Contains(out, "title=CVS") {
+		t.Fatalf("unexpected stores search out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "stores", "search", "pharmacy", "--json"}, "")
+	if err != nil {
+		t.Fatalf("stores search --json: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, `"ref": "store-1"`) || !strings.Contains(out, `"items"`) {
+		t.Fatalf("unexpected stores search --json out=%s", out)
+	}
+}
+
 func TestUberEatsCLI_ConfigSetRejectsNonEmptyUnmanagedProfileDir(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	profileDir := filepath.Join(t.TempDir(), "existing")
@@ -541,7 +585,7 @@ func TestUberEatsCLI_OrdersWatchRejectsPastFilter(t *testing.T) {
 	}
 }
 
-func TestUberEatsCLI_LoginAdoptsExistingConfiguredProfileDir(t *testing.T) {
+func TestUberEatsCLI_LoginRejectsLegacyProfileDirWithoutMarker(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	profileDir := filepath.Join(t.TempDir(), "ubereats-profile")
 	if err := os.MkdirAll(filepath.Join(profileDir, "Default"), 0o755); err != nil {
@@ -552,91 +596,6 @@ func TestUberEatsCLI_LoginAdoptsExistingConfiguredProfileDir(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(profileDir, "Default", "Cookies"), []byte("db"), 0o600); err != nil {
 		t.Fatalf("write cookies: %v", err)
-	}
-
-	origLogin := uberEatsLoginBrowser
-	origFactory := uberEatsClientFactory
-	t.Cleanup(func() {
-		uberEatsLoginBrowser = origLogin
-		uberEatsClientFactory = origFactory
-	})
-
-	uberEatsLoginBrowser = func(_ context.Context, targetURL string, gotProfileDir string, timeout time.Duration) (browserLoginResult, error) {
-		return browserLoginResult{
-			FinalURL:     targetURL,
-			UserAgent:    "Mozilla/5.0 Test",
-			CookieHeader: "sid=abc; auth=xyz",
-		}, nil
-	}
-	uberEatsClientFactory = func(st *state, cmd uberEatsCommand) uberEatsClient {
-		return fakeUberEatsClient{
-			checkSession: func(context.Context) (ubereats.Session, error) {
-				return ubereats.Session{LoggedIn: true}, nil
-			},
-			listOrders: func(context.Context, ubereats.OrderFilter, int) ([]ubereats.Order, error) {
-				return nil, nil
-			},
-			getOrder: func(context.Context, string) (ubereats.Order, error) {
-				return ubereats.Order{}, nil
-			},
-		}
-	}
-
-	cfg := config.New()
-	cfg.UberEats().BaseURL = "https://www.ubereats.com"
-	cfg.UberEats().BrowserProfile = profileDir
-	if err := config.Save(cfgPath, cfg); err != nil {
-		t.Fatalf("save config: %v", err)
-	}
-
-	out, _, err := runCLI(cfgPath, []string{"ubereats", "login"}, "")
-	if err != nil {
-		t.Fatalf("login: %v out=%s", err, out)
-	}
-	if _, err := os.Stat(filepath.Join(profileDir, uberEatsProfileMarker)); err != nil {
-		t.Fatalf("expected marker: %v", err)
-	}
-}
-
-func TestUberEatsCLI_LoginDoesNotAdoptLegacyProfileDirWhenValidationFails(t *testing.T) {
-	cfgPath := filepath.Join(t.TempDir(), "config.json")
-	profileDir := filepath.Join(t.TempDir(), "ubereats-profile")
-	if err := os.MkdirAll(filepath.Join(profileDir, "Default"), 0o755); err != nil {
-		t.Fatalf("mkdir profile: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(profileDir, "Local State"), []byte("{}"), 0o600); err != nil {
-		t.Fatalf("write local state: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(profileDir, "Default", "Cookies"), []byte("db"), 0o600); err != nil {
-		t.Fatalf("write cookies: %v", err)
-	}
-
-	origLogin := uberEatsLoginBrowser
-	origFactory := uberEatsClientFactory
-	t.Cleanup(func() {
-		uberEatsLoginBrowser = origLogin
-		uberEatsClientFactory = origFactory
-	})
-
-	uberEatsLoginBrowser = func(_ context.Context, targetURL string, gotProfileDir string, timeout time.Duration) (browserLoginResult, error) {
-		return browserLoginResult{
-			FinalURL:     targetURL,
-			UserAgent:    "Mozilla/5.0 Test",
-			CookieHeader: "sid=abc; auth=xyz",
-		}, nil
-	}
-	uberEatsClientFactory = func(st *state, cmd uberEatsCommand) uberEatsClient {
-		return fakeUberEatsClient{
-			checkSession: func(context.Context) (ubereats.Session, error) {
-				return ubereats.Session{LoggedIn: false}, nil
-			},
-			listOrders: func(context.Context, ubereats.OrderFilter, int) ([]ubereats.Order, error) {
-				return nil, nil
-			},
-			getOrder: func(context.Context, string) (ubereats.Order, error) {
-				return ubereats.Order{}, nil
-			},
-		}
 	}
 
 	cfg := config.New()
@@ -647,10 +606,26 @@ func TestUberEatsCLI_LoginDoesNotAdoptLegacyProfileDirWhenValidationFails(t *tes
 	}
 
 	_, _, err := runCLI(cfgPath, []string{"ubereats", "login"}, "")
-	if err == nil || !strings.Contains(err.Error(), "logged-in Uber Eats session") {
+	if err == nil || !strings.Contains(err.Error(), "refusing to use non-empty unmanaged profile dir") {
 		t.Fatalf("unexpected err=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(profileDir, uberEatsProfileMarker)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected no marker after failed validation, err=%v", err)
+		t.Fatalf("expected no marker after rejected legacy dir, err=%v", err)
+	}
+}
+
+func TestUberEatsCLI_ConfigShowSanitizesTamperedBaseURL(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	raw := []byte("{\n  \"version\": 1,\n  \"providers\": {\n    \"ubereats\": {\n      \"base_url\": \"https://evil.example.com\",\n      \"default_watch_interval\": 15000000000\n    }\n  }\n}\n")
+	if err := os.WriteFile(cfgPath, raw, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	out, _, err := runCLI(cfgPath, []string{"ubereats", "config", "show"}, "")
+	if err != nil {
+		t.Fatalf("config show: %v", err)
+	}
+	if !strings.Contains(out, "base_url=https://www.ubereats.com") {
+		t.Fatalf("unexpected out=%s", out)
 	}
 }

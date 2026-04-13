@@ -144,7 +144,10 @@ func (c *Client) ListOrders(ctx context.Context, filter OrderFilter, limit int) 
 	if filter == "" {
 		filter = OrderFilterActive
 	}
-	location, _ := c.DefaultLocation(ctx)
+	location, err := c.DefaultLocation(ctx)
+	if err != nil {
+		return nil, err
+	}
 	headers := c.locationHeaders(location)
 
 	res := browserpage.Result{FinalURL: c.ordersURL()}
@@ -217,7 +220,10 @@ func (c *Client) GetOrder(ctx context.Context, ref string) (Order, error) {
 		ref = parsedRef
 	}
 
-	location, _ := c.DefaultLocation(ctx)
+	location, err := c.DefaultLocation(ctx)
+	if err != nil {
+		return Order{}, err
+	}
 	headers := c.locationHeaders(location)
 
 	if activeOrders, err := c.ListOrders(ctx, OrderFilterActive, 0); err == nil {
@@ -430,23 +436,30 @@ func (c *Client) ensureSession(ctx context.Context) error {
 }
 
 func normalizeBaseURL(baseURL string) string {
+	const defaultBaseURL = "https://www.ubereats.com"
+
 	baseURL = strings.TrimSpace(baseURL)
 	if baseURL == "" {
-		baseURL = "https://www.ubereats.com"
+		return defaultBaseURL
 	}
 	u, err := url.Parse(baseURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return strings.TrimRight(baseURL, "/")
+	if err != nil {
+		return defaultBaseURL
 	}
-	if strings.EqualFold(u.Hostname(), "www.ubereats.com") {
-		u.Scheme = "https"
-		u.Host = u.Hostname()
-		u.Path = ""
-		u.RawQuery = ""
-		u.Fragment = ""
-		return strings.TrimRight(u.String(), "/")
+	if u.Scheme != "https" {
+		return defaultBaseURL
 	}
-	return strings.TrimRight(baseURL, "/")
+	if !strings.EqualFold(u.Hostname(), "www.ubereats.com") {
+		return defaultBaseURL
+	}
+	if port := strings.TrimSpace(u.Port()); port != "" && port != "443" {
+		return defaultBaseURL
+	}
+	u.Host = u.Hostname()
+	u.Path = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimRight(u.String(), "/")
 }
 
 func withBaseHeaders(headers map[string]string) map[string]string {

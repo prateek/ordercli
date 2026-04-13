@@ -274,8 +274,30 @@ func newUberEatsStoresCmd(st *state) *cobra.Command {
 		Use:   "stores",
 		Short: "Inspect Uber Eats stores",
 	}
+	cmd.AddCommand(newUberEatsStoresSearchCmd(st))
 	cmd.AddCommand(newUberEatsStoresShowCmd(st))
 	cmd.AddCommand(newUberEatsStoresMenuCmd(st))
+	return cmd
+}
+
+func newUberEatsStoresSearchCmd(st *state) *cobra.Command {
+	var asJSON bool
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "search <query>",
+		Short: "Search Uber Eats stores",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			stores, err := client.SearchStores(cmd.Context(), args[0], limit)
+			if err != nil {
+				return err
+			}
+			return writeUberEatsStores(cmd.OutOrStdout(), stores, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().IntVar(&limit, "limit", 20, "max stores to return")
 	return cmd
 }
 
@@ -389,7 +411,7 @@ func newUberEatsOrdersCmd(st *state) *cobra.Command {
 		Use:   "orders",
 		Short: "Inspect Uber Eats orders",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runUberEatsOrdersList(cmd, st, ubereats.OrderFilterActive, 20, asJSON, watchInterval(st, interval, watch), false)
+			return runUberEatsOrdersList(cmd, st, ubereats.OrderFilterActive, 20, asJSON, watchInterval(st, interval, watch))
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
@@ -408,7 +430,7 @@ func newUberEatsHistoryCmd(st *state) *cobra.Command {
 		Short:  "Deprecated compatibility alias for `orders list --filter past`",
 		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runUberEatsOrdersList(cmd, st, ubereats.OrderFilterPast, limit, asJSON, 0, true)
+			return runUberEatsOrdersList(cmd, st, ubereats.OrderFilterPast, limit, asJSON, 0)
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 20, "max orders to return")
@@ -424,7 +446,7 @@ func newUberEatsOrderCmd(st *state) *cobra.Command {
 		Hidden: true,
 		Args:   cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runUberEatsOrdersShow(cmd, st, args[0], asJSON, 0, true)
+			return runUberEatsOrdersShow(cmd, st, args[0], asJSON, 0)
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
@@ -442,7 +464,7 @@ func newUberEatsOrdersListCmd(st *state) *cobra.Command {
 		Use:   "list",
 		Short: "List Uber Eats orders",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runUberEatsOrdersList(cmd, st, ubereats.OrderFilter(strings.TrimSpace(filter)), limit, asJSON, watchInterval(st, interval, watch), false)
+			return runUberEatsOrdersList(cmd, st, ubereats.OrderFilter(strings.TrimSpace(filter)), limit, asJSON, watchInterval(st, interval, watch))
 		},
 	}
 
@@ -464,7 +486,7 @@ func newUberEatsOrdersShowCmd(st *state) *cobra.Command {
 		Short: "Show one Uber Eats order",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runUberEatsOrdersShow(cmd, st, args[0], asJSON, watchInterval(st, interval, watch), false)
+			return runUberEatsOrdersShow(cmd, st, args[0], asJSON, watchInterval(st, interval, watch))
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
@@ -473,7 +495,7 @@ func newUberEatsOrdersShowCmd(st *state) *cobra.Command {
 	return cmd
 }
 
-func runUberEatsOrdersList(cmd *cobra.Command, st *state, filter ubereats.OrderFilter, limit int, asJSON bool, interval time.Duration, legacyJSON bool) error {
+func runUberEatsOrdersList(cmd *cobra.Command, st *state, filter ubereats.OrderFilter, limit int, asJSON bool, interval time.Duration) error {
 	if filter == "" {
 		filter = ubereats.OrderFilterActive
 	}
@@ -486,7 +508,7 @@ func runUberEatsOrdersList(cmd *cobra.Command, st *state, filter ubereats.OrderF
 		if err != nil {
 			return err
 		}
-		return writeUberEatsOrders(cmd.OutOrStdout(), orders, asJSON, legacyJSON, "no orders")
+		return writeUberEatsOrders(cmd.OutOrStdout(), orders, asJSON, "no orders")
 	}
 	if interval <= 0 {
 		return run()
@@ -505,7 +527,7 @@ func runUberEatsOrdersList(cmd *cobra.Command, st *state, filter ubereats.OrderF
 	}
 }
 
-func runUberEatsOrdersShow(cmd *cobra.Command, st *state, ref string, asJSON bool, interval time.Duration, legacyJSON bool) error {
+func runUberEatsOrdersShow(cmd *cobra.Command, st *state, ref string, asJSON bool, interval time.Duration) error {
 	client := uberEatsClientFactory(st, uberEatsCommand{})
 	run := func() error {
 		if strings.EqualFold(strings.TrimSpace(ref), "latest") {
@@ -516,13 +538,13 @@ func runUberEatsOrdersShow(cmd *cobra.Command, st *state, ref string, asJSON boo
 			if len(orders) == 0 {
 				return errors.New("no Uber Eats orders found")
 			}
-			return writeUberEatsOrder(cmd.OutOrStdout(), orders[0], asJSON, legacyJSON)
+			return writeUberEatsOrder(cmd.OutOrStdout(), orders[0], asJSON)
 		}
 		order, err := client.GetOrder(cmd.Context(), ref)
 		if err != nil {
 			return err
 		}
-		return writeUberEatsOrder(cmd.OutOrStdout(), order, asJSON, legacyJSON)
+		return writeUberEatsOrder(cmd.OutOrStdout(), order, asJSON)
 	}
 	if interval <= 0 {
 		return run()
@@ -541,13 +563,10 @@ func runUberEatsOrdersShow(cmd *cobra.Command, st *state, ref string, asJSON boo
 	}
 }
 
-func writeUberEatsOrders(w io.Writer, orders []ubereats.Order, asJSON bool, legacyJSON bool, emptyMessage string) error {
+func writeUberEatsOrders(w io.Writer, orders []ubereats.Order, asJSON bool, emptyMessage string) error {
 	if asJSON {
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		if legacyJSON {
-			return enc.Encode(orders)
-		}
 		return enc.Encode(map[string]any{
 			"ok": true,
 			"data": map[string]any{
@@ -670,6 +689,32 @@ func writeUberEatsStore(w io.Writer, store ubereats.Store, asJSON bool) error {
 	}
 	_, err := fmt.Fprintln(w, strings.Join(parts, " "))
 	return err
+}
+
+func writeUberEatsStores(w io.Writer, stores []ubereats.Store, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"items": stores,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	if len(stores) == 0 {
+		_, err := fmt.Fprintln(w, "no stores")
+		return err
+	}
+	for _, store := range stores {
+		if err := writeUberEatsStore(w, store, false); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writeUberEatsStoreMenu(w io.Writer, menu ubereats.StoreMenu, asJSON bool) error {
@@ -847,13 +892,10 @@ func resolveUberEatsLocation(ctx context.Context, client uberEatsClient, ref str
 	return ubereats.Location{}, fmt.Errorf("address %q not found", ref)
 }
 
-func writeUberEatsOrder(w io.Writer, order ubereats.Order, asJSON bool, legacyJSON bool) error {
+func writeUberEatsOrder(w io.Writer, order ubereats.Order, asJSON bool) error {
 	if asJSON {
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		if legacyJSON {
-			return enc.Encode(order)
-		}
 		return enc.Encode(map[string]any{
 			"ok": true,
 			"data": map[string]any{
@@ -884,7 +926,7 @@ func ensureManagedUberEatsProfileDir(dir string) (string, error) {
 	if dir == "" {
 		return "", errors.New("browser profile dir missing")
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
 	markerPath := filepath.Join(dir, uberEatsProfileMarker)
@@ -907,19 +949,10 @@ func ensureManagedUberEatsProfileDir(dir string) (string, error) {
 func prepareUberEatsProfileDirForLogin(st *state, override string) (string, func() error, error) {
 	dir := uberEatsProfileDir(st, override)
 	managedDir, err := ensureManagedUberEatsProfileDir(dir)
-	if err == nil {
-		return managedDir, func() error { return nil }, nil
-	}
-	if !strings.Contains(err.Error(), "non-empty unmanaged profile dir") {
+	if err != nil {
 		return "", nil, err
 	}
-	if strings.TrimSpace(override) == "" && strings.TrimSpace(st.ubereats().BrowserProfile) == strings.TrimSpace(dir) && looksLikeLegacyUberEatsProfileDir(dir) {
-		return dir, func() error {
-			markerPath := filepath.Join(dir, uberEatsProfileMarker)
-			return os.WriteFile(markerPath, []byte("managed by ordercli\n"), 0o600)
-		}, nil
-	}
-	return "", nil, err
+	return managedDir, func() error { return nil }, nil
 }
 
 func removeManagedUberEatsProfileDir(dir string) error {
@@ -937,19 +970,6 @@ func removeManagedUberEatsProfileDir(dir string) error {
 		return err
 	}
 	return os.RemoveAll(dir)
-}
-
-func looksLikeLegacyUberEatsProfileDir(dir string) bool {
-	if _, err := os.Stat(filepath.Join(dir, "Local State")); err != nil {
-		return false
-	}
-	if _, err := os.Stat(filepath.Join(dir, "Default", "Cookies")); err == nil {
-		return true
-	}
-	if _, err := os.Stat(filepath.Join(dir, "Default", "Network", "Cookies")); err == nil {
-		return true
-	}
-	return false
 }
 
 func normalizeUberEatsBaseURL(baseURL string) (string, error) {

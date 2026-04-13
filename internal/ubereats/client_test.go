@@ -34,6 +34,13 @@ func TestNewClient_NormalizesUberBaseURL(t *testing.T) {
 	}
 }
 
+func TestNewClient_UsesSafeDefaultForUnsupportedBaseURL(t *testing.T) {
+	client := NewClient("https://evil.example.com", "/tmp/profile", "", nil)
+	if client.BaseURL != "https://www.ubereats.com" {
+		t.Fatalf("base_url=%q", client.BaseURL)
+	}
+}
+
 func TestClientCheckSession_UsesProfileSessionWhenCookieMissing(t *testing.T) {
 	var sessionReads int
 	var requestCookies []string
@@ -97,7 +104,7 @@ func TestClientListOrders_PastUsesPlainHTTPWithCookies(t *testing.T) {
 				}
 				switch req.URL.Path {
 				case "/_p/api/getDeliveryLocationsV2":
-					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{}}}`), nil
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
 				case "/_p/api/getPastOrdersV1":
 					return jsonResponse(t, 200, `{
 						"status":"success",
@@ -137,6 +144,26 @@ func TestClientListOrders_PastUsesPlainHTTPWithCookies(t *testing.T) {
 	}
 	if len(requests) != 2 {
 		t.Fatalf("requests=%v", requests)
+	}
+}
+
+func TestClientListOrders_FailsWhenDefaultLocationUnavailable(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/_p/api/getDeliveryLocationsV2" {
+					t.Fatalf("unexpected request %s", req.URL.Path)
+				}
+				return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{}}}`), nil
+			}),
+		},
+	}
+
+	_, err := client.ListOrders(context.Background(), OrderFilterPast, 20)
+	if err == nil || !strings.Contains(err.Error(), "no delivery location found") {
+		t.Fatalf("unexpected err=%v", err)
 	}
 }
 
@@ -405,7 +432,7 @@ func TestClientGetOrder_FallsBackToPastWhenActiveFails(t *testing.T) {
 			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				switch req.URL.Path {
 				case "/_p/api/getDeliveryLocationsV2":
-					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{}}}`), nil
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
 				case "/_p/api/getActiveOrdersV1":
 					return jsonResponse(t, 500, `{"status":"failure"}`), nil
 				case "/_p/api/getPastOrdersV1":
@@ -443,5 +470,25 @@ func TestClientGetOrder_FallsBackToPastWhenActiveFails(t *testing.T) {
 	}
 	if order.UUID != "past-9" {
 		t.Fatalf("order=%+v", order)
+	}
+}
+
+func TestClientGetOrder_FailsWhenDefaultLocationUnavailable(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/_p/api/getDeliveryLocationsV2" {
+					t.Fatalf("unexpected request %s", req.URL.Path)
+				}
+				return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{}}}`), nil
+			}),
+		},
+	}
+
+	_, err := client.GetOrder(context.Background(), "past-9")
+	if err == nil || !strings.Contains(err.Error(), "no delivery location found") {
+		t.Fatalf("unexpected err=%v", err)
 	}
 }
