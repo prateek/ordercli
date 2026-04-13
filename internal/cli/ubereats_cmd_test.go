@@ -27,6 +27,8 @@ type fakeUberEatsClient struct {
 	searchItems           func(context.Context, string, int) ([]ubereats.StoreItem, error)
 	searchStoreItems      func(context.Context, string, string, int) ([]ubereats.StoreItem, error)
 	getMenuItem           func(context.Context, string, string) (ubereats.ItemDetail, error)
+	listCarts             func(context.Context, int) ([]ubereats.Cart, error)
+	getCart               func(context.Context, string) (ubereats.Cart, error)
 }
 
 func (f fakeUberEatsClient) SetCookieHeader(string) {}
@@ -81,6 +83,14 @@ func (f fakeUberEatsClient) SearchStoreItems(ctx context.Context, storeRef, quer
 
 func (f fakeUberEatsClient) GetMenuItem(ctx context.Context, storeRef, itemRef string) (ubereats.ItemDetail, error) {
 	return f.getMenuItem(ctx, storeRef, itemRef)
+}
+
+func (f fakeUberEatsClient) ListCarts(ctx context.Context, limit int) ([]ubereats.Cart, error) {
+	return f.listCarts(ctx, limit)
+}
+
+func (f fakeUberEatsClient) GetCart(ctx context.Context, ref string) (ubereats.Cart, error) {
+	return f.getCart(ctx, ref)
 }
 
 func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
@@ -597,6 +607,83 @@ func TestUberEatsCLI_StoreList(t *testing.T) {
 	}
 	if !strings.Contains(out, `"ref": "store-2"`) || !strings.Contains(out, `"favorite": true`) {
 		t.Fatalf("unexpected stores list favorites out=%s", out)
+	}
+}
+
+func TestUberEatsCLI_CartsListShow(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	oldFactory := uberEatsClientFactory
+	t.Cleanup(func() { uberEatsClientFactory = oldFactory })
+	uberEatsClientFactory = func(st *state, _ uberEatsCommand) uberEatsClient {
+		return fakeUberEatsClient{
+			listCarts: func(_ context.Context, limit int) ([]ubereats.Cart, error) {
+				if limit != 20 {
+					t.Fatalf("limit=%d", limit)
+				}
+				return []ubereats.Cart{{
+					Ref:           "draft-1",
+					CartRef:       "cart-1",
+					StoreRef:      "store-1",
+					StoreTitle:    "CVS",
+					ItemCount:     2,
+					Subtotal:      "$15.99",
+					DeliveryType:  "ASAP",
+					CheckoutReady: false,
+				}}, nil
+			},
+			getCart: func(_ context.Context, ref string) (ubereats.Cart, error) {
+				if ref != "draft-1" {
+					t.Fatalf("ref=%q", ref)
+				}
+				return ubereats.Cart{
+					Ref:               "draft-1",
+					CartRef:           "cart-1",
+					StoreRef:          "store-1",
+					StoreTitle:        "CVS",
+					CheckoutReady:     true,
+					DeliveryType:      "ASAP",
+					InteractionType:   "leave_at_door",
+					Address:           "222 E 39th St",
+					FeeSummary:        "Fees $1.25",
+					PaymentProfileRef: "payment-1",
+					ItemCount:         2,
+					Subtotal:          "$15.99",
+					Items: []ubereats.CartItem{{
+						Ref:          "line-1",
+						ItemRef:      "item-1",
+						Title:        "Gummy Bears",
+						Quantity:     2,
+						Note:         "red only",
+						PriceMinor:   399,
+						TotalMinor:   798,
+						CurrencyCode: "USD",
+					}},
+					SessionInfo: ubereats.SessionInfo{
+						LocationSource:    "TARGET",
+						LocationRef:       "loc-1",
+						Location:          "222 E 39th St",
+						Profile:           "Personal",
+						PaymentProfileRef: "payment-1",
+					},
+				}, nil
+			},
+		}
+	}
+
+	out, _, err := runCLI(cfgPath, []string{"ubereats", "carts", "list"}, "")
+	if err != nil {
+		t.Fatalf("carts list: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "ref=draft-1") || !strings.Contains(out, "store=CVS") || !strings.Contains(out, "checkout_ready=false") {
+		t.Fatalf("unexpected carts list out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "carts", "show", "draft-1", "--json"}, "")
+	if err != nil {
+		t.Fatalf("carts show: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, `"ref": "draft-1"`) || !strings.Contains(out, `"payment_profile_ref": "payment-1"`) || !strings.Contains(out, `"checkout_ready": true`) || !strings.Contains(out, `"fee_summary": "Fees $1.25"`) {
+		t.Fatalf("unexpected carts show out=%s", out)
 	}
 }
 

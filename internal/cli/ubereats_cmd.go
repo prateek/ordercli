@@ -219,6 +219,55 @@ func newUberEatsAddressesCmd(st *state) *cobra.Command {
 	return cmd
 }
 
+func newUberEatsCartsCmd(st *state) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "carts",
+		Short: "Inspect Uber Eats draft carts",
+	}
+	cmd.AddCommand(newUberEatsCartsListCmd(st))
+	cmd.AddCommand(newUberEatsCartsShowCmd(st))
+	return cmd
+}
+
+func newUberEatsCartsListCmd(st *state) *cobra.Command {
+	var asJSON bool
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List Uber Eats draft carts",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			carts, err := client.ListCarts(cmd.Context(), limit)
+			if err != nil {
+				return err
+			}
+			return writeUberEatsCarts(cmd.OutOrStdout(), carts, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().IntVar(&limit, "limit", 20, "max carts to return")
+	return cmd
+}
+
+func newUberEatsCartsShowCmd(st *state) *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "show <cart-ref>",
+		Short: "Show one Uber Eats draft cart",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			cart, err := client.GetCart(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			return writeUberEatsCart(cmd.OutOrStdout(), cart, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	return cmd
+}
+
 func newUberEatsAddressesListCmd(st *state) *cobra.Command {
 	var asJSON bool
 	var limit int
@@ -681,6 +730,89 @@ func writeUberEatsAddressDetails(w io.Writer, details uberEatsAddressDetails, as
 	return err
 }
 
+func writeUberEatsCarts(w io.Writer, carts []ubereats.Cart, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"items": carts,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	if len(carts) == 0 {
+		_, err := fmt.Fprintln(w, "no carts")
+		return err
+	}
+	for _, cart := range carts {
+		if _, err := fmt.Fprintln(w, cartSummaryString(cart)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeUberEatsCart(w io.Writer, cart ubereats.Cart, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"item": cart,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	lines := []string{
+		"ref=" + cart.Ref,
+	}
+	appendLine := func(key, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		lines = append(lines, key+"="+value)
+	}
+	appendLine("cart_ref", cart.CartRef)
+	appendLine("store_ref", cart.StoreRef)
+	appendLine("store", cart.StoreTitle)
+	appendLine("state", cart.State)
+	appendLine("subtotal", cart.Subtotal)
+	appendLine("total", cart.Total)
+	appendLine("delivery_type", cart.DeliveryType)
+	appendLine("interaction_type", cart.InteractionType)
+	appendLine("checkout_ready", fmt.Sprintf("%t", cart.CheckoutReady))
+	appendLine("fee_summary", cart.FeeSummary)
+	appendLine("address", cart.Address)
+	appendLine("location_source", cart.SessionInfo.LocationSource)
+	appendLine("location_ref", cart.SessionInfo.LocationRef)
+	appendLine("location", cart.SessionInfo.Location)
+	appendLine("profile", cart.SessionInfo.Profile)
+	paymentProfileRef := cart.PaymentProfileRef
+	if strings.TrimSpace(paymentProfileRef) == "" {
+		paymentProfileRef = cart.SessionInfo.PaymentProfileRef
+	}
+	appendLine("payment_profile_ref", paymentProfileRef)
+	if cart.ItemCount > 0 {
+		appendLine("item_count", fmt.Sprintf("%d", cart.ItemCount))
+	}
+	if len(cart.Items) > 0 {
+		lines = append(lines, "items:")
+		for _, item := range cart.Items {
+			lines = append(lines, "  "+formatUberEatsCartItem(item))
+		}
+	}
+	_, err := fmt.Fprintln(w, strings.Join(lines, "\n"))
+	return err
+}
+
 func writeUberEatsStore(w io.Writer, store ubereats.Store, asJSON bool) error {
 	if asJSON {
 		enc := json.NewEncoder(w)
@@ -866,6 +998,59 @@ func formatUberEatsStoreItem(item ubereats.StoreItem) string {
 	}
 	if item.HasCustomizations {
 		parts = append(parts, "has_customizations=true")
+	}
+	return strings.Join(parts, " ")
+}
+
+func cartSummaryString(cart ubereats.Cart) string {
+	parts := []string{
+		"ref=" + cart.Ref,
+	}
+	if strings.TrimSpace(cart.CartRef) != "" {
+		parts = append(parts, "cart_ref="+cart.CartRef)
+	}
+	if strings.TrimSpace(cart.StoreRef) != "" {
+		parts = append(parts, "store_ref="+cart.StoreRef)
+	}
+	if strings.TrimSpace(cart.StoreTitle) != "" {
+		parts = append(parts, "store="+cart.StoreTitle)
+	}
+	if cart.ItemCount > 0 {
+		parts = append(parts, fmt.Sprintf("item_count=%d", cart.ItemCount))
+	}
+	if strings.TrimSpace(cart.Subtotal) != "" {
+		parts = append(parts, "subtotal="+cart.Subtotal)
+	}
+	if strings.TrimSpace(cart.DeliveryType) != "" {
+		parts = append(parts, "delivery_type="+cart.DeliveryType)
+	}
+	parts = append(parts, fmt.Sprintf("checkout_ready=%t", cart.CheckoutReady))
+	if strings.TrimSpace(cart.FeeSummary) != "" {
+		parts = append(parts, "fee_summary="+cart.FeeSummary)
+	}
+	if strings.TrimSpace(cart.Address) != "" {
+		parts = append(parts, "address="+cart.Address)
+	}
+	return strings.Join(parts, " ")
+}
+
+func formatUberEatsCartItem(item ubereats.CartItem) string {
+	parts := []string{
+		"cart_item_ref=" + item.Ref,
+		"item_ref=" + item.ItemRef,
+		"title=" + item.Title,
+	}
+	if item.Quantity > 0 {
+		parts = append(parts, fmt.Sprintf("quantity=%d", item.Quantity))
+	}
+	if strings.TrimSpace(item.Note) != "" {
+		parts = append(parts, "note="+item.Note)
+	}
+	if price := formatUberEatsMinorMoney(item.PriceMinor, item.CurrencyCode); price != "" {
+		parts = append(parts, "price="+price)
+	}
+	if total := formatUberEatsMinorMoney(item.TotalMinor, item.CurrencyCode); total != "" {
+		parts = append(parts, "total="+total)
 	}
 	return strings.Join(parts, " ")
 }
