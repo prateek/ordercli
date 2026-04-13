@@ -14,12 +14,17 @@ import (
 )
 
 type fakeUberEatsClient struct {
-	checkSession         func(context.Context) (ubereats.Session, error)
-	listOrders           func(context.Context, ubereats.OrderFilter, int) ([]ubereats.Order, error)
-	getOrder             func(context.Context, string) (ubereats.Order, error)
-	listLocations        func(context.Context) ([]ubereats.Location, error)
-	defaultLocation      func(context.Context) (ubereats.Location, error)
+	checkSession          func(context.Context) (ubereats.Session, error)
+	listOrders            func(context.Context, ubereats.OrderFilter, int) ([]ubereats.Order, error)
+	getOrder              func(context.Context, string) (ubereats.Order, error)
+	listLocations         func(context.Context) ([]ubereats.Location, error)
+	defaultLocation       func(context.Context) (ubereats.Location, error)
 	getInstructionContext func(context.Context, ubereats.Location) (ubereats.InstructionContext, error)
+	getStore              func(context.Context, string) (ubereats.Store, error)
+	getStoreMenu          func(context.Context, string) (ubereats.StoreMenu, error)
+	searchItems           func(context.Context, string, int) ([]ubereats.StoreItem, error)
+	searchStoreItems      func(context.Context, string, string, int) ([]ubereats.StoreItem, error)
+	getMenuItem           func(context.Context, string, string) (ubereats.ItemDetail, error)
 }
 
 func (f fakeUberEatsClient) SetCookieHeader(string) {}
@@ -46,6 +51,26 @@ func (f fakeUberEatsClient) DefaultLocation(ctx context.Context) (ubereats.Locat
 
 func (f fakeUberEatsClient) GetInstructionContext(ctx context.Context, location ubereats.Location) (ubereats.InstructionContext, error) {
 	return f.getInstructionContext(ctx, location)
+}
+
+func (f fakeUberEatsClient) GetStore(ctx context.Context, ref string) (ubereats.Store, error) {
+	return f.getStore(ctx, ref)
+}
+
+func (f fakeUberEatsClient) GetStoreMenu(ctx context.Context, ref string) (ubereats.StoreMenu, error) {
+	return f.getStoreMenu(ctx, ref)
+}
+
+func (f fakeUberEatsClient) SearchItems(ctx context.Context, query string, limit int) ([]ubereats.StoreItem, error) {
+	return f.searchItems(ctx, query, limit)
+}
+
+func (f fakeUberEatsClient) SearchStoreItems(ctx context.Context, storeRef, query string, limit int) ([]ubereats.StoreItem, error) {
+	return f.searchStoreItems(ctx, storeRef, query, limit)
+}
+
+func (f fakeUberEatsClient) GetMenuItem(ctx context.Context, storeRef, itemRef string) (ubereats.ItemDetail, error) {
+	return f.getMenuItem(ctx, storeRef, itemRef)
 }
 
 func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
@@ -235,7 +260,7 @@ func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("orders --json: %v out=%s", err, out)
 	}
-	if !strings.Contains(out, `"uuid": "active-1"`) || strings.Contains(out, `"ok": true`) {
+	if !strings.Contains(out, `"uuid": "active-1"`) || !strings.Contains(out, `"ok": true`) || !strings.Contains(out, `"items"`) {
 		t.Fatalf("unexpected orders --json out=%s", out)
 	}
 
@@ -273,7 +298,7 @@ func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
 		t.Fatalf("unexpected latest out=%s", out)
 	}
 
-	out, _, err = runCLI(cfgPath, []string{"ubereats", "addresses", "list", "--limit", "1"}, "")
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "addresses", "list"}, "")
 	if err != nil {
 		t.Fatalf("addresses list: %v out=%s", err, out)
 	}
@@ -313,6 +338,167 @@ func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
 	}
 	if strings.Contains(out, "browser_profile=") || strings.Contains(out, "http_user_agent=") {
 		t.Fatalf("unexpected out=%s", out)
+	}
+}
+
+func TestUberEatsCLI_StoresAndItems(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	oldFactory := uberEatsClientFactory
+	t.Cleanup(func() { uberEatsClientFactory = oldFactory })
+	uberEatsClientFactory = func(st *state, _ uberEatsCommand) uberEatsClient {
+		return fakeUberEatsClient{
+			getStore: func(context.Context, string) (ubereats.Store, error) {
+				return ubereats.Store{
+					Ref:          "store-1",
+					Title:        "Rosa Mexicano",
+					CurrencyCode: "USD",
+					Orderable:    false,
+					Favorite:     false,
+					Rating:       4.8,
+					RatingCount:  "5,000+",
+					ETADisplay:   "20-35 min",
+					FeeDisplay:   "$2.49",
+				}, nil
+			},
+			getStoreMenu: func(context.Context, string) (ubereats.StoreMenu, error) {
+				return ubereats.StoreMenu{
+					Store: ubereats.Store{Ref: "store-1", Title: "Rosa Mexicano", CurrencyCode: "USD"},
+					Sections: []ubereats.StoreMenuSection{
+						{
+							Ref:   "section-1",
+							Title: "Menu",
+							Items: []ubereats.StoreItem{
+								{
+									Ref:           "item-1",
+									StoreRef:      "store-1",
+									StoreTitle:    "Rosa Mexicano",
+									SectionRef:    "section-1",
+									SubsectionRef: "sub-1",
+									Title:         "Ahi Tuna Taquitos",
+									PriceMinor:    2530,
+									CurrencyCode:  "USD",
+								},
+							},
+						},
+					},
+				}, nil
+			},
+			searchItems: func(context.Context, string, int) ([]ubereats.StoreItem, error) {
+				return []ubereats.StoreItem{
+					{
+						Ref:               "item-2",
+						StoreRef:          "store-2",
+						StoreTitle:        "CVS",
+						SectionRef:        "section-9",
+						SubsectionRef:     "sub-9",
+						Title:             "Gummy Bears",
+						Description:       "Haribo",
+						PriceMinor:        0,
+						CurrencyCode:      "USD",
+						SoldOut:           false,
+						HasCustomizations: false,
+					},
+				}, nil
+			},
+			searchStoreItems: func(context.Context, string, string, int) ([]ubereats.StoreItem, error) {
+				return []ubereats.StoreItem{
+					{
+						Ref:           "item-1",
+						StoreRef:      "store-1",
+						StoreTitle:    "Rosa Mexicano",
+						SectionRef:    "section-1",
+						SubsectionRef: "sub-1",
+						Title:         "Ahi Tuna Taquitos",
+						Description:   "Soy-lime marinade",
+						PriceMinor:    2530,
+						CurrencyCode:  "USD",
+					},
+				}, nil
+			},
+			getMenuItem: func(context.Context, string, string) (ubereats.ItemDetail, error) {
+				return ubereats.ItemDetail{
+					StoreItem: ubereats.StoreItem{
+						Ref:               "item-1",
+						StoreRef:          "store-1",
+						StoreTitle:        "Rosa Mexicano",
+						SectionRef:        "section-1",
+						SubsectionRef:     "sub-1",
+						Title:             "Ahi Tuna Taquitos",
+						Description:       "Soy-lime marinade",
+						PriceMinor:        2530,
+						CurrencyCode:      "USD",
+						HasCustomizations: true,
+					},
+					Customizations: []ubereats.CustomizationGroup{
+						{
+							Ref:   "group-1",
+							Title: "Add Dips",
+							Options: []ubereats.CustomizationOption{
+								{Ref: "option-1", Title: "Caesar Dressing", PriceMinor: 0},
+							},
+						},
+					},
+				}, nil
+			},
+		}
+	}
+
+	out, _, err := runCLI(cfgPath, []string{"ubereats", "stores", "show", "store-1"}, "")
+	if err != nil {
+		t.Fatalf("stores show: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "ref=store-1") || !strings.Contains(out, "title=Rosa Mexicano") {
+		t.Fatalf("unexpected stores show out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "stores", "show", "store-1", "--json"}, "")
+	if err != nil {
+		t.Fatalf("stores show --json: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, `"orderable": false`) || !strings.Contains(out, `"favorite": false`) {
+		t.Fatalf("unexpected stores show --json out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "stores", "menu", "store-1"}, "")
+	if err != nil {
+		t.Fatalf("stores menu: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "section_ref=section-1") || !strings.Contains(out, "item_ref=item-1") {
+		t.Fatalf("unexpected stores menu out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "items", "search", "tuna", "--store", "store-1"}, "")
+	if err != nil {
+		t.Fatalf("items search: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "item_ref=item-1") || !strings.Contains(out, "store_ref=store-1") {
+		t.Fatalf("unexpected items search out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "items", "search", "gummy"}, "")
+	if err != nil {
+		t.Fatalf("items search global: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "item_ref=item-2") || !strings.Contains(out, "store_ref=store-2") {
+		t.Fatalf("unexpected global items search out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "items", "search", "gummy", "--json"}, "")
+	if err != nil {
+		t.Fatalf("items search --json: %v out=%s", err, out)
+	}
+	for _, want := range []string{`"price_minor": 0`, `"sold_out": false`, `"has_customizations": false`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in items search --json out=%s", want, out)
+		}
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "items", "show", "item-1", "--store", "store-1"}, "")
+	if err != nil {
+		t.Fatalf("items show: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "item_ref=item-1") || !strings.Contains(out, "customization_ref=group-1") || strings.Contains(out, "option_ref=option-1 title=Caesar Dressing price=") {
+		t.Fatalf("unexpected items show out=%s", out)
 	}
 }
 

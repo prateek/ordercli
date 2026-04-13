@@ -58,6 +58,11 @@ type uberEatsClient interface {
 	ListLocations(context.Context) ([]ubereats.Location, error)
 	DefaultLocation(context.Context) (ubereats.Location, error)
 	GetInstructionContext(context.Context, ubereats.Location) (ubereats.InstructionContext, error)
+	GetStore(context.Context, string) (ubereats.Store, error)
+	GetStoreMenu(context.Context, string) (ubereats.StoreMenu, error)
+	SearchItems(context.Context, string, int) ([]ubereats.StoreItem, error)
+	SearchStoreItems(context.Context, string, string, int) ([]ubereats.StoreItem, error)
+	GetMenuItem(context.Context, string, string) (ubereats.ItemDetail, error)
 	ListOrders(context.Context, ubereats.OrderFilter, int) ([]ubereats.Order, error)
 	GetOrder(context.Context, string) (ubereats.Order, error)
 }

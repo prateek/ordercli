@@ -232,6 +232,7 @@ func newUberEatsAddressesListCmd(st *state) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			locations = savedUberEatsLocations(locations)
 			locations = limitUberEatsLocations(locations, limit)
 			return writeUberEatsLocations(cmd.OutOrStdout(), locations, asJSON)
 		},
@@ -268,6 +269,117 @@ func newUberEatsAddressesShowCmd(st *state) *cobra.Command {
 	return cmd
 }
 
+func newUberEatsStoresCmd(st *state) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "stores",
+		Short: "Inspect Uber Eats stores",
+	}
+	cmd.AddCommand(newUberEatsStoresShowCmd(st))
+	cmd.AddCommand(newUberEatsStoresMenuCmd(st))
+	return cmd
+}
+
+func newUberEatsStoresShowCmd(st *state) *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "show <store-ref>",
+		Short: "Show one Uber Eats store",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			store, err := client.GetStore(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			return writeUberEatsStore(cmd.OutOrStdout(), store, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	return cmd
+}
+
+func newUberEatsStoresMenuCmd(st *state) *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "menu <store-ref>",
+		Short: "Show one Uber Eats store menu",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			menu, err := client.GetStoreMenu(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			return writeUberEatsStoreMenu(cmd.OutOrStdout(), menu, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	return cmd
+}
+
+func newUberEatsItemsCmd(st *state) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "items",
+		Short: "Inspect Uber Eats menu items",
+	}
+	cmd.AddCommand(newUberEatsItemsSearchCmd(st))
+	cmd.AddCommand(newUberEatsItemsShowCmd(st))
+	return cmd
+}
+
+func newUberEatsItemsSearchCmd(st *state) *cobra.Command {
+	var asJSON bool
+	var storeRef string
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "search <query>",
+		Short: "Search store items within one Uber Eats store",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			var (
+				items []ubereats.StoreItem
+				err   error
+			)
+			if strings.TrimSpace(storeRef) == "" {
+				items, err = client.SearchItems(cmd.Context(), args[0], limit)
+			} else {
+				items, err = client.SearchStoreItems(cmd.Context(), storeRef, args[0], limit)
+			}
+			if err != nil {
+				return err
+			}
+			return writeUberEatsStoreItems(cmd.OutOrStdout(), items, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().StringVar(&storeRef, "store", "", "store ref")
+	cmd.Flags().IntVar(&limit, "limit", 20, "max items to return")
+	return cmd
+}
+
+func newUberEatsItemsShowCmd(st *state) *cobra.Command {
+	var asJSON bool
+	var storeRef string
+	cmd := &cobra.Command{
+		Use:   "show <item-ref>",
+		Short: "Show one Uber Eats menu item",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			item, err := client.GetMenuItem(cmd.Context(), storeRef, args[0])
+			if err != nil {
+				return err
+			}
+			return writeUberEatsItemDetail(cmd.OutOrStdout(), item, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().StringVar(&storeRef, "store", "", "store ref")
+	_ = cmd.MarkFlagRequired("store")
+	return cmd
+}
+
 func newUberEatsOrdersCmd(st *state) *cobra.Command {
 	var asJSON bool
 	var watch bool
@@ -277,7 +389,7 @@ func newUberEatsOrdersCmd(st *state) *cobra.Command {
 		Use:   "orders",
 		Short: "Inspect Uber Eats orders",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runUberEatsOrdersList(cmd, st, ubereats.OrderFilterActive, 20, asJSON, watchInterval(st, interval, watch), true)
+			return runUberEatsOrdersList(cmd, st, ubereats.OrderFilterActive, 20, asJSON, watchInterval(st, interval, watch), false)
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
@@ -523,6 +635,129 @@ func writeUberEatsAddressDetails(w io.Writer, details uberEatsAddressDetails, as
 	return err
 }
 
+func writeUberEatsStore(w io.Writer, store ubereats.Store, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"item": store,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	parts := []string{
+		"ref=" + store.Ref,
+		"title=" + store.Title,
+		"currency=" + store.CurrencyCode,
+		fmt.Sprintf("orderable=%t", store.Orderable),
+		fmt.Sprintf("favorite=%t", store.Favorite),
+	}
+	if store.Rating != 0 {
+		parts = append(parts, fmt.Sprintf("rating=%.1f", store.Rating))
+	}
+	if strings.TrimSpace(store.RatingCount) != "" {
+		parts = append(parts, "rating_count="+store.RatingCount)
+	}
+	if strings.TrimSpace(store.ETADisplay) != "" {
+		parts = append(parts, "eta="+store.ETADisplay)
+	}
+	if strings.TrimSpace(store.FeeDisplay) != "" {
+		parts = append(parts, "fee="+store.FeeDisplay)
+	}
+	_, err := fmt.Fprintln(w, strings.Join(parts, " "))
+	return err
+}
+
+func writeUberEatsStoreMenu(w io.Writer, menu ubereats.StoreMenu, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"item": menu,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	lines := []string{
+		"store_ref=" + menu.Store.Ref + " title=" + menu.Store.Title + " currency=" + menu.Store.CurrencyCode,
+	}
+	for _, section := range menu.Sections {
+		line := "section_ref=" + section.Ref + " title=" + section.Title
+		if strings.TrimSpace(section.Subtitle) != "" {
+			line += " subtitle=" + section.Subtitle
+		}
+		lines = append(lines, line)
+		for _, item := range section.Items {
+			lines = append(lines, "  "+formatUberEatsStoreItem(item))
+		}
+	}
+	_, err := fmt.Fprintln(w, strings.Join(lines, "\n"))
+	return err
+}
+
+func writeUberEatsStoreItems(w io.Writer, items []ubereats.StoreItem, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"items": items,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	if len(items) == 0 {
+		_, err := fmt.Fprintln(w, "no items")
+		return err
+	}
+	for _, item := range items {
+		if _, err := fmt.Fprintln(w, formatUberEatsStoreItem(item)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeUberEatsItemDetail(w io.Writer, item ubereats.ItemDetail, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"item": item,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	lines := []string{formatUberEatsStoreItem(item.StoreItem)}
+	for _, group := range item.Customizations {
+		lines = append(lines, "customization_ref="+group.Ref+" title="+group.Title)
+		for _, option := range group.Options {
+			line := "  option_ref=" + option.Ref + " title=" + option.Title
+			if price := formatUberEatsMinorMoney(option.PriceMinor, item.CurrencyCode); price != "" {
+				line += " price=" + price
+			}
+			lines = append(lines, line)
+		}
+	}
+	_, err := fmt.Fprintln(w, strings.Join(lines, "\n"))
+	return err
+}
+
 func formatUberEatsLocation(location ubereats.Location) string {
 	parts := []string{
 		"ref=" + location.Ref,
@@ -540,11 +775,59 @@ func formatUberEatsLocation(location ubereats.Location) string {
 	return strings.Join(parts, " ")
 }
 
+func formatUberEatsStoreItem(item ubereats.StoreItem) string {
+	parts := []string{
+		"item_ref=" + item.Ref,
+		"store_ref=" + item.StoreRef,
+		"section_ref=" + item.SectionRef,
+		"subsection_ref=" + item.SubsectionRef,
+		"title=" + item.Title,
+	}
+	if strings.TrimSpace(item.Description) != "" {
+		parts = append(parts, "description="+item.Description)
+	}
+	if item.PriceMinor > 0 {
+		parts = append(parts, "price="+formatUberEatsMinorMoney(item.PriceMinor, item.CurrencyCode))
+	}
+	if item.SoldOut {
+		parts = append(parts, "sold_out=true")
+	}
+	if item.HasCustomizations {
+		parts = append(parts, "has_customizations=true")
+	}
+	return strings.Join(parts, " ")
+}
+
 func limitUberEatsLocations(locations []ubereats.Location, limit int) []ubereats.Location {
 	if limit <= 0 || len(locations) <= limit {
 		return locations
 	}
 	return locations[:limit]
+}
+
+func savedUberEatsLocations(locations []ubereats.Location) []ubereats.Location {
+	out := make([]ubereats.Location, 0, len(locations))
+	for _, location := range locations {
+		if location.Source == "SAVED" {
+			out = append(out, location)
+		}
+	}
+	return out
+}
+
+func formatUberEatsMinorMoney(minor int, currency string) string {
+	if minor <= 0 {
+		return ""
+	}
+	switch strings.ToUpper(strings.TrimSpace(currency)) {
+	case "USD":
+		return fmt.Sprintf("$%.2f", float64(minor)/100)
+	default:
+		if strings.TrimSpace(currency) == "" {
+			return fmt.Sprintf("%.2f", float64(minor)/100)
+		}
+		return fmt.Sprintf("%s %.2f", strings.ToUpper(strings.TrimSpace(currency)), float64(minor)/100)
+	}
 }
 
 func resolveUberEatsLocation(ctx context.Context, client uberEatsClient, ref string) (ubereats.Location, error) {
