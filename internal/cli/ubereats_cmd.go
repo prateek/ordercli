@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -208,6 +209,65 @@ func newUberEatsLogoutCmd(st *state) *cobra.Command {
 	return cmd
 }
 
+func newUberEatsAddressesCmd(st *state) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "addresses",
+		Short: "Inspect Uber Eats delivery addresses",
+	}
+	cmd.AddCommand(newUberEatsAddressesListCmd(st))
+	cmd.AddCommand(newUberEatsAddressesShowCmd(st))
+	return cmd
+}
+
+func newUberEatsAddressesListCmd(st *state) *cobra.Command {
+	var asJSON bool
+	var limit int
+
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List Uber Eats delivery addresses",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			locations, err := client.ListLocations(cmd.Context())
+			if err != nil {
+				return err
+			}
+			locations = limitUberEatsLocations(locations, limit)
+			return writeUberEatsLocations(cmd.OutOrStdout(), locations, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().IntVar(&limit, "limit", 20, "max addresses to return")
+	return cmd
+}
+
+func newUberEatsAddressesShowCmd(st *state) *cobra.Command {
+	var asJSON bool
+
+	cmd := &cobra.Command{
+		Use:   "show <address-ref|default>",
+		Short: "Show one Uber Eats delivery address",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			location, err := resolveUberEatsLocation(cmd.Context(), client, args[0])
+			if err != nil {
+				return err
+			}
+			instructionContext, err := client.GetInstructionContext(cmd.Context(), location)
+			if err != nil {
+				return err
+			}
+			return writeUberEatsAddressDetails(cmd.OutOrStdout(), uberEatsAddressDetails{
+				Location:           location,
+				InstructionContext: instructionContext,
+			}, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	return cmd
+}
+
 func newUberEatsOrdersCmd(st *state) *cobra.Command {
 	var asJSON bool
 	var watch bool
@@ -396,6 +456,112 @@ func writeUberEatsOrders(w io.Writer, orders []ubereats.Order, asJSON bool, lega
 		}
 	}
 	return nil
+}
+
+func writeUberEatsLocations(w io.Writer, locations []ubereats.Location, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"items": locations,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	if len(locations) == 0 {
+		_, err := fmt.Fprintln(w, "no addresses")
+		return err
+	}
+	for _, location := range locations {
+		if _, err := fmt.Fprintln(w, formatUberEatsLocation(location)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type uberEatsAddressDetails struct {
+	Location           ubereats.Location           `json:"location"`
+	InstructionContext ubereats.InstructionContext `json:"instruction_context,omitempty"`
+}
+
+func writeUberEatsAddressDetails(w io.Writer, details uberEatsAddressDetails, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"item": details,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	lines := []string{formatUberEatsLocation(details.Location)}
+	if details.InstructionContext.DefaultInteractionType != "" {
+		lines = append(lines, "default_interaction_type="+details.InstructionContext.DefaultInteractionType)
+	}
+	if details.InstructionContext.PreferredInteractionType != "" {
+		lines = append(lines, "preferred_interaction_type="+details.InstructionContext.PreferredInteractionType)
+	}
+	if details.InstructionContext.SelectedInstruction.InteractionType != "" {
+		lines = append(lines, "selected_interaction_type="+details.InstructionContext.SelectedInstruction.InteractionType)
+	}
+	if len(details.InstructionContext.AvailableInteractionTypes) > 0 {
+		lines = append(lines, "available_interaction_types="+strings.Join(details.InstructionContext.AvailableInteractionTypes, ","))
+	}
+	if strings.TrimSpace(details.InstructionContext.SelectedInstruction.DisplayString) != "" {
+		lines = append(lines, "selected_instruction="+details.InstructionContext.SelectedInstruction.DisplayString)
+	}
+	_, err := fmt.Fprintln(w, strings.Join(lines, "\n"))
+	return err
+}
+
+func formatUberEatsLocation(location ubereats.Location) string {
+	parts := []string{
+		"ref=" + location.Ref,
+		"source=" + location.Source,
+	}
+	if strings.TrimSpace(location.Label) != "" {
+		parts = append(parts, "label="+location.Label)
+	}
+	if strings.TrimSpace(location.Title) != "" {
+		parts = append(parts, "title="+location.Title)
+	}
+	if strings.TrimSpace(location.FullAddress) != "" {
+		parts = append(parts, "address="+location.FullAddress)
+	}
+	return strings.Join(parts, " ")
+}
+
+func limitUberEatsLocations(locations []ubereats.Location, limit int) []ubereats.Location {
+	if limit <= 0 || len(locations) <= limit {
+		return locations
+	}
+	return locations[:limit]
+}
+
+func resolveUberEatsLocation(ctx context.Context, client uberEatsClient, ref string) (ubereats.Location, error) {
+	ref = strings.TrimSpace(ref)
+	if strings.EqualFold(ref, "default") {
+		return client.DefaultLocation(ctx)
+	}
+	locations, err := client.ListLocations(ctx)
+	if err != nil {
+		return ubereats.Location{}, err
+	}
+	for _, location := range locations {
+		if location.Ref == ref {
+			return location, nil
+		}
+	}
+	return ubereats.Location{}, fmt.Errorf("address %q not found", ref)
 }
 
 func writeUberEatsOrder(w io.Writer, order ubereats.Order, asJSON bool, legacyJSON bool) error {

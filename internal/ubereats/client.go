@@ -32,9 +32,27 @@ type Session struct {
 type Location struct {
 	Ref         string  `json:"ref,omitempty"`
 	Source      string  `json:"source,omitempty"`
+	Label       string  `json:"label,omitempty"`
+	Title       string  `json:"title,omitempty"`
 	FullAddress string  `json:"full_address,omitempty"`
 	Latitude    float64 `json:"latitude,omitempty"`
 	Longitude   float64 `json:"longitude,omitempty"`
+
+	locationPayload map[string]any
+}
+
+type Instruction struct {
+	InteractionType string `json:"interaction_type,omitempty"`
+	DisplayString   string `json:"display_string,omitempty"`
+	Notes           string `json:"notes,omitempty"`
+	AptOrSuite      string `json:"apt_or_suite,omitempty"`
+}
+
+type InstructionContext struct {
+	AvailableInteractionTypes []string    `json:"available_interaction_types,omitempty"`
+	DefaultInteractionType    string      `json:"default_interaction_type,omitempty"`
+	PreferredInteractionType  string      `json:"preferred_interaction_type,omitempty"`
+	SelectedInstruction       Instruction `json:"selected_instruction,omitempty"`
 }
 
 type Client struct {
@@ -85,25 +103,41 @@ func (c *Client) DefaultLocation(ctx context.Context) (Location, error) {
 	if err != nil {
 		return Location{}, err
 	}
-	data, _ := parsed["data"].(map[string]any)
-	deliveryLocations, _ := data["deliveryLocations"].(map[string]any)
-	for _, source := range []string{"SAVED", "TARGET", "SUGGESTED"} {
-		items, _ := deliveryLocations[source].([]any)
-		if len(items) == 0 {
-			continue
+	locations := extractLocations(parsed)
+	for _, source := range []string{"TARGET", "SAVED", "SUGGESTED"} {
+		for _, location := range locations {
+			if location.Source == source {
+				return location, nil
+			}
 		}
-		entry, _ := items[0].(map[string]any)
-		loc, _ := entry["location"].(map[string]any)
-		coord, _ := loc["coordinate"].(map[string]any)
-		return Location{
-			Ref:         stringValue(loc["id"]),
-			Source:      source,
-			FullAddress: stringValue(loc["fullAddress"]),
-			Latitude:    floatValue(coord["latitude"]),
-			Longitude:   floatValue(coord["longitude"]),
-		}, nil
 	}
 	return Location{}, errors.New("ubereats: no delivery location found")
+}
+
+func (c *Client) ListLocations(ctx context.Context) ([]Location, error) {
+	parsed, err := c.post(ctx, c.ordersURL(), c.endpointURL("getDeliveryLocationsV2"), map[string]any{
+		"locationTypes": []string{"TARGET", "SAVED", "SUGGESTED"},
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return extractLocations(parsed), nil
+}
+
+func (c *Client) GetInstructionContext(ctx context.Context, location Location) (InstructionContext, error) {
+	parsed, err := c.post(ctx, c.ordersURL(), c.endpointURL("getInstructionForLocationV1"), map[string]any{
+		"location": instructionLocationPayload(location),
+	}, c.locationHeaders(location))
+	if err != nil {
+		return InstructionContext{}, err
+	}
+	data, _ := parsed["data"].(map[string]any)
+	return InstructionContext{
+		AvailableInteractionTypes: stringSliceValue(data["availableInteractionTypes"]),
+		DefaultInteractionType:    stringValue(data["defaultInteractionType"]),
+		PreferredInteractionType:  stringValue(data["preferredInteractionType"]),
+		SelectedInstruction:       instructionFromMap(data["selectedInstruction"]),
+	}, nil
 }
 
 func (c *Client) ListOrders(ctx context.Context, filter OrderFilter, limit int) ([]Order, error) {
@@ -514,6 +548,192 @@ func floatValue(v any) float64 {
 	default:
 		return 0
 	}
+}
+
+func extractLocations(parsed map[string]any) []Location {
+	data, _ := parsed["data"].(map[string]any)
+	deliveryLocations, _ := data["deliveryLocations"].(map[string]any)
+	out := make([]Location, 0)
+	for _, source := range []string{"TARGET", "SAVED", "SUGGESTED"} {
+		items, _ := deliveryLocations[source].([]any)
+		for _, rawItem := range items {
+			entry, _ := rawItem.(map[string]any)
+			loc, _ := entry["location"].(map[string]any)
+			coord, _ := loc["coordinate"].(map[string]any)
+			personalization, _ := loc["personalization"].(map[string]any)
+			title := firstNonEmptyString(
+				stringValue(entry["title"]),
+				stringValue(loc["title"]),
+				stringValue(loc["name"]),
+			)
+			subtitle := firstNonEmptyString(
+				stringValue(entry["subtitle"]),
+				stringValue(loc["subtitle"]),
+				stringValue(loc["addressLine2"]),
+			)
+			out = append(out, Location{
+				Ref:         stringValue(loc["id"]),
+				Source:      source,
+				Label:       stringValue(personalization["label"]),
+				Title:       title,
+				FullAddress: firstNonEmptyString(stringValue(loc["fullAddress"]), joinNonEmpty(", ", title, subtitle), title),
+				Latitude:    floatValue(coord["latitude"]),
+				Longitude:   floatValue(coord["longitude"]),
+				locationPayload: cloneMap(entry),
+			})
+		}
+	}
+	return out
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func joinNonEmpty(sep string, values ...string) string {
+	filtered := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			filtered = append(filtered, value)
+		}
+	}
+	return strings.Join(filtered, sep)
+}
+
+func instructionLocationPayload(location Location) map[string]any {
+	entry := cloneMap(location.locationPayload)
+	loc, _ := entry["location"].(map[string]any)
+	if len(loc) == 0 {
+		loc = map[string]any{}
+	}
+	title := firstNonEmptyString(
+		stringValue(entry["title"]),
+		stringValue(loc["title"]),
+		stringValue(loc["name"]),
+		location.Title,
+	)
+	subtitle := firstNonEmptyString(
+		stringValue(entry["subtitle"]),
+		stringValue(loc["subtitle"]),
+		stringValue(loc["addressLine2"]),
+	)
+	personalization, _ := loc["personalization"].(map[string]any)
+	label := firstNonEmptyString(stringValue(personalization["label"]), location.Label)
+	return map[string]any{
+		"address": map[string]any{
+			"address1":             firstNonEmptyString(stringValue(loc["addressLine1"]), title),
+			"address2":             firstNonEmptyString(stringValue(loc["addressLine2"]), subtitle),
+			"aptOrSuite":           "",
+			"eaterFormattedAddress": firstNonEmptyString(stringValue(loc["fullAddress"]), location.FullAddress, joinNonEmpty(", ", title, subtitle)),
+			"subtitle":             subtitle,
+			"title":                title,
+			"uuid":                 "",
+			"label":                label,
+		},
+		"latitude":          firstNonZeroFloat(floatValueFromNested(loc, "coordinate", "latitude"), location.Latitude),
+		"longitude":         firstNonZeroFloat(floatValueFromNested(loc, "coordinate", "longitude"), location.Longitude),
+		"reference":         firstNonEmptyString(stringValue(loc["id"]), location.Ref),
+		"referenceType":     firstNonEmptyString(stringValue(loc["provider"]), "uber_places"),
+		"type":              firstNonEmptyString(stringValue(loc["provider"]), "uber_places"),
+		"addressComponents": normalizeAddressComponents(mapValue(loc["addressComponents"])),
+		"categories":        sliceValue(loc["categories"]),
+		"originType":        firstNonEmptyString(stringValue(loc["originType"]), "user_autocomplete"),
+	}
+}
+
+func instructionFromMap(v any) Instruction {
+	m, _ := v.(map[string]any)
+	return Instruction{
+		InteractionType: stringValue(m["interactionType"]),
+		DisplayString:   stringValue(m["displayString"]),
+		Notes:           stringValue(m["notes"]),
+		AptOrSuite:      stringValue(m["aptOrSuite"]),
+	}
+}
+
+func stringSliceValue(v any) []string {
+	items, _ := v.([]any)
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if s := stringValue(item); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func sliceValue(v any) []any {
+	items, _ := v.([]any)
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]any, 0, len(items))
+	out = append(out, items...)
+	return out
+}
+
+func mapValue(v any) map[string]any {
+	m, _ := v.(map[string]any)
+	return cloneMap(m)
+}
+
+func cloneMap(src map[string]any) map[string]any {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
+}
+
+func normalizeAddressComponents(components map[string]any) map[string]any {
+	if len(components) == 0 {
+		return nil
+	}
+	out := map[string]any{}
+	for key, value := range components {
+		switch key {
+		case "CITY":
+			out["city"] = value
+		case "COUNTRY_CODE":
+			out["countryCode"] = value
+		case "FIRST_LEVEL_SUBDIVISION_CODE":
+			out["firstLevelSubdivisionCode"] = value
+		case "POSTAL_CODE":
+			out["postalCode"] = value
+		default:
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func floatValueFromNested(m map[string]any, keys ...string) float64 {
+	current := any(m)
+	for _, key := range keys {
+		next, _ := current.(map[string]any)
+		current = next[key]
+	}
+	return floatValue(current)
+}
+
+func firstNonZeroFloat(values ...float64) float64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func uuidFromOrderRef(ref string) string {

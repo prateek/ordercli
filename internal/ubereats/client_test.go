@@ -140,7 +140,7 @@ func TestClientListOrders_PastUsesPlainHTTPWithCookies(t *testing.T) {
 	}
 }
 
-func TestClientDefaultLocation_PrefersSavedOverTarget(t *testing.T) {
+func TestClientDefaultLocation_PrefersTargetOverSaved(t *testing.T) {
 	client := &Client{
 		BaseURL:      "https://www.ubereats.com",
 		CookieHeader: "sid=abc; auth=xyz",
@@ -150,7 +150,7 @@ func TestClientDefaultLocation_PrefersSavedOverTarget(t *testing.T) {
 					"status":"success",
 					"data":{
 						"deliveryLocations":{
-							"TARGET":[{"location":{"id":"target-1","fullAddress":"Target Address","coordinate":{"latitude":1.0,"longitude":2.0}}}],
+							"TARGET":[{"title":"Target Address","subtitle":"New York, NY","location":{"id":"target-1","coordinate":{"latitude":1.0,"longitude":2.0}}}],
 							"SAVED":[{"location":{"id":"saved-1","fullAddress":"Saved Address","coordinate":{"latitude":3.0,"longitude":4.0}}}]
 						}
 					}
@@ -163,8 +163,161 @@ func TestClientDefaultLocation_PrefersSavedOverTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DefaultLocation: %v", err)
 	}
-	if location.Ref != "saved-1" || location.Source != "SAVED" || location.FullAddress != "Saved Address" {
+	if location.Ref != "target-1" || location.Source != "TARGET" || location.FullAddress != "Target Address, New York, NY" {
 		t.Fatalf("location=%+v", location)
+	}
+}
+
+func TestClientListLocations_ExtractsAllSources(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return jsonResponse(t, 200, `{
+					"status":"success",
+					"data":{
+						"deliveryLocations":{
+							"SAVED":[
+								{
+									"title":"Home",
+									"subtitle":"New York, NY",
+									"location":{
+										"id":"saved-1",
+										"fullAddress":"222 E 39th St, New York, NY 10016, US",
+										"coordinate":{"latitude":40.748198,"longitude":-73.9746683},
+										"personalization":{"label":"home"}
+									}
+								}
+							],
+							"TARGET":[
+								{
+									"title":"Office",
+									"subtitle":"Midtown",
+									"location":{
+										"id":"target-1",
+										"coordinate":{"latitude":40.752700,"longitude":-73.977200}
+									}
+								}
+							],
+							"SUGGESTED":[
+								{
+									"location":{
+										"id":"suggested-1",
+										"name":"Bryant Park",
+										"fullAddress":"1 Bryant Park, New York, NY 10036, US",
+										"coordinate":{"latitude":40.755500,"longitude":-73.984000}
+									}
+								}
+							]
+						}
+					}
+				}`), nil
+			}),
+		},
+	}
+
+	locations, err := client.ListLocations(context.Background())
+	if err != nil {
+		t.Fatalf("ListLocations: %v", err)
+	}
+	if len(locations) != 3 {
+		t.Fatalf("locations=%+v", locations)
+	}
+	if locations[0].Ref != "target-1" || locations[0].Source != "TARGET" || locations[0].Title != "Office" || locations[0].FullAddress != "Office, Midtown" {
+		t.Fatalf("target=%+v", locations[0])
+	}
+	if locations[1].Ref != "saved-1" || locations[1].Source != "SAVED" || locations[1].Label != "home" || locations[1].Title != "Home" {
+		t.Fatalf("saved=%+v", locations[1])
+	}
+	if locations[2].Ref != "suggested-1" || locations[2].Source != "SUGGESTED" || locations[2].Title != "Bryant Park" {
+		t.Fatalf("suggested=%+v", locations[2])
+	}
+}
+
+func TestClientGetInstructionContext_BuildsLocationRequest(t *testing.T) {
+	var requestBody map[string]any
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/_p/api/getInstructionForLocationV1" {
+					t.Fatalf("path=%s", req.URL.Path)
+				}
+				rawBody, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("read request body: %v", err)
+				}
+				if err := json.Unmarshal(rawBody, &requestBody); err != nil {
+					t.Fatalf("unmarshal request body: %v", err)
+				}
+				return jsonResponse(t, 200, `{
+					"status":"success",
+					"data":{
+						"availableInteractionTypes":["door_to_door","leave_at_door"],
+						"defaultInteractionType":"door_to_door",
+						"preferredInteractionType":"leave_at_door",
+						"selectedInstruction":{
+							"interactionType":"leave_at_door",
+							"displayString":"Leave at my door",
+							"notes":"use the side entrance"
+						}
+					}
+				}`), nil
+			}),
+		},
+	}
+
+	location := Location{
+		Ref:         "loc-1",
+		Source:      "TARGET",
+		Label:       "home",
+		Title:       "222 E 39th St",
+		FullAddress: "222 E 39th St, New York, NY 10016-2754, US",
+		Latitude:    40.748198,
+		Longitude:   -73.9746683,
+		locationPayload: map[string]any{
+			"location": map[string]any{
+				"id":           "loc-1",
+				"provider":     "uber_places",
+				"addressLine1": "222 E 39th St",
+				"addressLine2": "New York, NY",
+				"fullAddress":  "222 E 39th St, New York, NY 10016-2754, US",
+				"coordinate":   map[string]any{"latitude": 40.748198, "longitude": -73.9746683},
+				"categories":   []any{"RESIDENCE"},
+				"personalization": map[string]any{
+					"label": "home",
+				},
+				"addressComponents": map[string]any{
+					"CITY":                         "New York",
+					"COUNTRY_CODE":                 "US",
+					"FIRST_LEVEL_SUBDIVISION_CODE": "NY",
+					"POSTAL_CODE":                  "10016-2754",
+				},
+			},
+		},
+	}
+
+	context, err := client.GetInstructionContext(context.Background(), location)
+	if err != nil {
+		t.Fatalf("GetInstructionContext: %v", err)
+	}
+	if context.DefaultInteractionType != "door_to_door" || context.PreferredInteractionType != "leave_at_door" || context.SelectedInstruction.InteractionType != "leave_at_door" {
+		t.Fatalf("context=%+v", context)
+	}
+
+	locationPayload, _ := requestBody["location"].(map[string]any)
+	address, _ := locationPayload["address"].(map[string]any)
+	if address["address1"] != "222 E 39th St" || address["address2"] != "New York, NY" || address["label"] != "home" {
+		t.Fatalf("address payload=%+v", address)
+	}
+	if locationPayload["reference"] != "loc-1" || locationPayload["referenceType"] != "uber_places" || locationPayload["type"] != "uber_places" {
+		t.Fatalf("location payload=%+v", locationPayload)
+	}
+	addressComponents, _ := locationPayload["addressComponents"].(map[string]any)
+	if addressComponents["city"] != "New York" || addressComponents["countryCode"] != "US" || addressComponents["postalCode"] != "10016-2754" {
+		t.Fatalf("addressComponents=%+v", addressComponents)
 	}
 }
 

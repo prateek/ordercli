@@ -55,6 +55,9 @@ type uberEatsCommand struct{}
 type uberEatsClient interface {
 	SetCookieHeader(string)
 	CheckSession(context.Context) (ubereats.Session, error)
+	ListLocations(context.Context) ([]ubereats.Location, error)
+	DefaultLocation(context.Context) (ubereats.Location, error)
+	GetInstructionContext(context.Context, ubereats.Location) (ubereats.InstructionContext, error)
 	ListOrders(context.Context, ubereats.OrderFilter, int) ([]ubereats.Order, error)
 	GetOrder(context.Context, string) (ubereats.Order, error)
 }

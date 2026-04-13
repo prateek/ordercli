@@ -39,6 +39,7 @@ func newUberEatsCmd(st *state) *cobra.Command {
 	cmd.AddCommand(newUberEatsConfigCmd(st))
 	cmd.AddCommand(newUberEatsLoginCmd(st))
 	cmd.AddCommand(newUberEatsLogoutCmd(st))
+	cmd.AddCommand(newUberEatsAddressesCmd(st))
 	cmd.AddCommand(newUberEatsOrdersCmd(st))
 	cmd.AddCommand(newUberEatsHistoryCmd(st))
 	cmd.AddCommand(newUberEatsOrderCmd(st))

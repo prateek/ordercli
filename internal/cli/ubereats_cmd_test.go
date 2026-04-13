@@ -14,9 +14,12 @@ import (
 )
 
 type fakeUberEatsClient struct {
-	checkSession func(context.Context) (ubereats.Session, error)
-	listOrders   func(context.Context, ubereats.OrderFilter, int) ([]ubereats.Order, error)
-	getOrder     func(context.Context, string) (ubereats.Order, error)
+	checkSession         func(context.Context) (ubereats.Session, error)
+	listOrders           func(context.Context, ubereats.OrderFilter, int) ([]ubereats.Order, error)
+	getOrder             func(context.Context, string) (ubereats.Order, error)
+	listLocations        func(context.Context) ([]ubereats.Location, error)
+	defaultLocation      func(context.Context) (ubereats.Location, error)
+	getInstructionContext func(context.Context, ubereats.Location) (ubereats.InstructionContext, error)
 }
 
 func (f fakeUberEatsClient) SetCookieHeader(string) {}
@@ -31,6 +34,18 @@ func (f fakeUberEatsClient) ListOrders(ctx context.Context, filter ubereats.Orde
 
 func (f fakeUberEatsClient) GetOrder(ctx context.Context, ref string) (ubereats.Order, error) {
 	return f.getOrder(ctx, ref)
+}
+
+func (f fakeUberEatsClient) ListLocations(ctx context.Context) ([]ubereats.Location, error) {
+	return f.listLocations(ctx)
+}
+
+func (f fakeUberEatsClient) DefaultLocation(ctx context.Context) (ubereats.Location, error) {
+	return f.defaultLocation(ctx)
+}
+
+func (f fakeUberEatsClient) GetInstructionContext(ctx context.Context, location ubereats.Location) (ubereats.InstructionContext, error) {
+	return f.getInstructionContext(ctx, location)
 }
 
 func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
@@ -130,6 +145,43 @@ func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
 					SessionInfo: ubereats.SessionInfo{LocationSource: "TARGET", LocationRef: "loc-1"},
 				}, nil
 			},
+			listLocations: func(context.Context) ([]ubereats.Location, error) {
+				return []ubereats.Location{
+					{
+						Ref:         "saved-1",
+						Source:      "SAVED",
+						Label:       "home",
+						Title:       "Home",
+						FullAddress: "222 E 39th St, New York, NY 10016, US",
+					},
+					{
+						Ref:         "suggested-1",
+						Source:      "SUGGESTED",
+						Title:       "Office",
+						FullAddress: "1 Bryant Park, New York, NY 10036, US",
+					},
+				}, nil
+			},
+			defaultLocation: func(context.Context) (ubereats.Location, error) {
+				return ubereats.Location{
+					Ref:         "saved-1",
+					Source:      "SAVED",
+					Label:       "home",
+					Title:       "Home",
+					FullAddress: "222 E 39th St, New York, NY 10016, US",
+				}, nil
+			},
+			getInstructionContext: func(context.Context, ubereats.Location) (ubereats.InstructionContext, error) {
+				return ubereats.InstructionContext{
+					AvailableInteractionTypes: []string{"door_to_door", "leave_at_door"},
+					DefaultInteractionType:    "door_to_door",
+					PreferredInteractionType:  "leave_at_door",
+					SelectedInstruction: ubereats.Instruction{
+						InteractionType: "leave_at_door",
+						DisplayString:   "Leave at my door",
+					},
+				}, nil
+			},
 		}
 	}
 
@@ -219,6 +271,22 @@ func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
 	}
 	if !strings.Contains(out, "uuid=past-1") {
 		t.Fatalf("unexpected latest out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "addresses", "list", "--limit", "1"}, "")
+	if err != nil {
+		t.Fatalf("addresses list: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "ref=saved-1") || strings.Contains(out, "ref=suggested-1") {
+		t.Fatalf("unexpected addresses list out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "addresses", "show", "default"}, "")
+	if err != nil {
+		t.Fatalf("addresses show default: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "ref=saved-1") || !strings.Contains(out, "label=home") || !strings.Contains(out, "selected_interaction_type=leave_at_door") {
+		t.Fatalf("unexpected addresses show out=%s", out)
 	}
 
 	out, _, err = runCLI(cfgPath, []string{"ubereats", "order", "past-1", "--json"}, "")
