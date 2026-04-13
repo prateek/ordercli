@@ -227,6 +227,7 @@ func newUberEatsCartsCmd(st *state) *cobra.Command {
 	cmd.AddCommand(newUberEatsCartsListCmd(st))
 	cmd.AddCommand(newUberEatsCartsShowCmd(st))
 	cmd.AddCommand(newUberEatsCartsCreateCmd(st))
+	cmd.AddCommand(newUberEatsCartsUpdateCmd(st))
 	cmd.AddCommand(newUberEatsCartsDiscardCmd(st))
 	cmd.AddCommand(newUberEatsCartItemsCmd(st))
 	return cmd
@@ -273,17 +274,32 @@ func newUberEatsCartsShowCmd(st *state) *cobra.Command {
 
 func newUberEatsCartsCreateCmd(st *state) *cobra.Command {
 	var asJSON bool
+	var fromOrderRef string
 	var storeRef string
 	var itemRef string
 	var quantity int
 	var note string
 	cmd := &cobra.Command{
 		Use:   "create",
-		Short: "Create one Uber Eats draft cart from a store item",
+		Short: "Create one Uber Eats draft cart",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := uberEatsClientFactory(st, uberEatsCommand{})
-			cart, err := client.CreateCartFromItem(cmd.Context(), storeRef, itemRef, quantity, note)
+			var (
+				cart ubereats.Cart
+				err  error
+			)
+			switch {
+			case strings.TrimSpace(fromOrderRef) != "":
+				if strings.TrimSpace(storeRef) != "" || strings.TrimSpace(itemRef) != "" || strings.TrimSpace(note) != "" || quantity != 1 {
+					return fmt.Errorf("ubereats: --from-order cannot be combined with --store, --item, --note, or a non-default --quantity")
+				}
+				cart, err = client.CreateCartFromOrder(cmd.Context(), fromOrderRef)
+			case strings.TrimSpace(storeRef) != "" && strings.TrimSpace(itemRef) != "":
+				cart, err = client.CreateCartFromItem(cmd.Context(), storeRef, itemRef, quantity, note)
+			default:
+				return fmt.Errorf("ubereats: either --from-order or both --store and --item are required")
+			}
 			if err != nil {
 				return err
 			}
@@ -291,12 +307,37 @@ func newUberEatsCartsCreateCmd(st *state) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().StringVar(&fromOrderRef, "from-order", "", "order ref")
 	cmd.Flags().StringVar(&storeRef, "store", "", "store ref")
 	cmd.Flags().StringVar(&itemRef, "item", "", "item ref")
 	cmd.Flags().IntVar(&quantity, "quantity", 1, "item quantity")
 	cmd.Flags().StringVar(&note, "note", "", "special instructions")
-	_ = cmd.MarkFlagRequired("store")
-	_ = cmd.MarkFlagRequired("item")
+	return cmd
+}
+
+func newUberEatsCartsUpdateCmd(st *state) *cobra.Command {
+	var asJSON bool
+	var deliveryType string
+	var interactionType string
+	cmd := &cobra.Command{
+		Use:   "update <cart-ref>",
+		Short: "Update one Uber Eats draft cart",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			result, err := client.UpdateCart(cmd.Context(), args[0], ubereats.CartUpdate{
+				DeliveryType:    deliveryType,
+				InteractionType: interactionType,
+			})
+			if err != nil {
+				return err
+			}
+			return writeUberEatsCartMutation(cmd.OutOrStdout(), result, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().StringVar(&deliveryType, "delivery-type", "", "delivery type (regular or premium)")
+	cmd.Flags().StringVar(&interactionType, "interaction-type", "", "interaction type")
 	return cmd
 }
 
@@ -324,7 +365,68 @@ func newUberEatsCartItemsCmd(st *state) *cobra.Command {
 		Use:   "items",
 		Short: "Mutate Uber Eats cart items",
 	}
+	cmd.AddCommand(newUberEatsCartItemsAddCmd(st))
+	cmd.AddCommand(newUberEatsCartItemsUpdateCmd(st))
 	cmd.AddCommand(newUberEatsCartItemsRemoveCmd(st))
+	return cmd
+}
+
+func newUberEatsCartItemsAddCmd(st *state) *cobra.Command {
+	var asJSON bool
+	var itemRef string
+	var quantity int
+	var note string
+	cmd := &cobra.Command{
+		Use:   "add <cart-ref>",
+		Short: "Add one item to an Uber Eats draft cart",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(itemRef) == "" {
+				return fmt.Errorf("ubereats: --item is required")
+			}
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			result, err := client.AddCartItem(cmd.Context(), args[0], itemRef, quantity, note)
+			if err != nil {
+				return err
+			}
+			return writeUberEatsCartMutation(cmd.OutOrStdout(), result, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().StringVar(&itemRef, "item", "", "item ref")
+	cmd.Flags().IntVar(&quantity, "quantity", 1, "item quantity")
+	cmd.Flags().StringVar(&note, "note", "", "special instructions")
+	return cmd
+}
+
+func newUberEatsCartItemsUpdateCmd(st *state) *cobra.Command {
+	var asJSON bool
+	var quantity int
+	var note string
+	cmd := &cobra.Command{
+		Use:   "update <cart-ref> <cart-item-ref>",
+		Short: "Update one item in an Uber Eats draft cart",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			update := ubereats.CartItemUpdate{}
+			if cmd.Flags().Changed("quantity") {
+				update.Quantity = &quantity
+			}
+			if cmd.Flags().Changed("note") {
+				noteValue := note
+				update.Note = &noteValue
+			}
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			result, err := client.UpdateCartItem(cmd.Context(), args[0], args[1], update)
+			if err != nil {
+				return err
+			}
+			return writeUberEatsCartMutation(cmd.OutOrStdout(), result, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().IntVar(&quantity, "quantity", 0, "replacement quantity")
+	cmd.Flags().StringVar(&note, "note", "", "replacement special instructions")
 	return cmd
 }
 
@@ -907,6 +1009,12 @@ func writeUberEatsCartMutation(w io.Writer, result ubereats.CartMutation, asJSON
 		})
 	}
 	parts := []string{"ref=" + result.Ref}
+	if result.Added {
+		parts = append(parts, "added=true")
+	}
+	if result.Updated {
+		parts = append(parts, "updated=true")
+	}
 	if result.Removed {
 		parts = append(parts, "removed=true")
 	}

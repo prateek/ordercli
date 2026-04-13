@@ -3,6 +3,7 @@ package ubereats
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -38,14 +39,42 @@ type CartItem struct {
 	CurrencyCode string `json:"currency_code,omitempty"`
 }
 
+const (
+	CartDeliveryTypeRegular = "regular"
+	CartDeliveryTypePremium = "premium"
+)
+
+type CartItemUpdate struct {
+	Quantity *int    `json:"quantity,omitempty"`
+	Note     *string `json:"note,omitempty"`
+}
+
+type CartUpdate struct {
+	DeliveryType    string `json:"delivery_type,omitempty"`
+	InteractionType string `json:"interaction_type,omitempty"`
+}
+
 type CartMutation struct {
 	Ref       string `json:"ref,omitempty"`
+	Added     bool   `json:"added,omitempty"`
+	Updated   bool   `json:"updated,omitempty"`
 	Removed   bool   `json:"removed,omitempty"`
 	Discarded bool   `json:"discarded,omitempty"`
 	Cart      *Cart  `json:"cart,omitempty"`
 }
 
 var newUUID = randomUUID
+
+type cartDetail struct {
+	Cart
+	raw map[string]any
+}
+
+type orderSeed struct {
+	StoreRef     string
+	CurrencyCode string
+	Items        []map[string]any
+}
 
 func (c *Client) ListCarts(ctx context.Context, limit int) ([]Cart, error) {
 	parsed, err := c.post(ctx, c.ordersURL(), c.endpointURL("getCartsViewForEaterUuidV1"), map[string]any{}, nil)
@@ -78,6 +107,184 @@ func (c *Client) CreateCartFromItem(ctx context.Context, storeRef, itemRef strin
 		return Cart{}, fmt.Errorf("ubereats: item %q requires customizations that are not yet supported", item.Ref)
 	}
 
+	return c.createCart(ctx, storeRef, []map[string]any{cartLineFromMenuItem(item, quantity, note)}, item.CurrencyCode)
+}
+
+func (c *Client) CreateCartFromOrder(ctx context.Context, ref string) (Cart, error) {
+	seed, err := c.findOrderSeed(ctx, ref)
+	if err != nil {
+		return Cart{}, err
+	}
+	return c.createCart(ctx, seed.StoreRef, seed.Items, seed.CurrencyCode)
+}
+
+func (c *Client) AddCartItem(ctx context.Context, ref, itemRef string, quantity int, note string) (CartMutation, error) {
+	ref = strings.TrimSpace(ref)
+	itemRef = strings.TrimSpace(itemRef)
+	note = strings.TrimSpace(note)
+	if itemRef == "" {
+		return CartMutation{}, fmt.Errorf("ubereats: item ref is required")
+	}
+	if quantity <= 0 {
+		return CartMutation{}, fmt.Errorf("ubereats: quantity must be positive")
+	}
+
+	detail, err := c.resolveCartDetail(ctx, ref)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	item, err := c.GetMenuItem(ctx, detail.StoreRef, itemRef)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	if itemRequiresCustomization(item) {
+		return CartMutation{}, fmt.Errorf("ubereats: item %q requires customizations that are not yet supported", item.Ref)
+	}
+	location, err := c.DefaultLocation(ctx)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	line := cartLineFromMenuItem(item, quantity, note)
+	parsed, err := c.post(ctx, c.ordersURL(), c.endpointURL("addItemsToDraftOrderV2"), map[string]any{
+		"draftOrderUUID":               detail.Ref,
+		"cartUUID":                     detail.CartRef,
+		"items":                        []any{line},
+		"shouldUpdateDraftOrderMetadata": false,
+		"storeUUID":                    detail.StoreRef,
+		"actionMeta":                   map[string]any{"isQuickAdd": false, "numClicks": 1},
+	}, c.locationHeaders(location))
+	if err != nil {
+		return CartMutation{}, err
+	}
+	if !responseIncludesMappedString(nestedMapValue(parsed, "data")["addedItems"], stringValue(line["shoppingCartItemUuid"]), "shoppingCartItemUuid", "shoppingCartItemUUID") {
+		return CartMutation{}, fmt.Errorf("ubereats: addItemsToDraftOrderV2 did not confirm added item %q", itemRef)
+	}
+	updatedCart, err := c.GetCart(ctx, detail.Ref)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	return CartMutation{Ref: updatedCart.Ref, Added: true, Cart: &updatedCart}, nil
+}
+
+func (c *Client) UpdateCartItem(ctx context.Context, ref, cartItemRef string, update CartItemUpdate) (CartMutation, error) {
+	cartItemRef = strings.TrimSpace(cartItemRef)
+	if cartItemRef == "" {
+		return CartMutation{}, fmt.Errorf("ubereats: cart item ref is required")
+	}
+	if update.Quantity == nil && update.Note == nil {
+		return CartMutation{}, fmt.Errorf("ubereats: at least one cart item field must be updated")
+	}
+	if update.Quantity != nil && *update.Quantity <= 0 {
+		return CartMutation{}, fmt.Errorf("ubereats: quantity must be positive")
+	}
+
+	detail, err := c.resolveCartDetail(ctx, ref)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	rawItem := findCartItemPayload(detail.raw, cartItemRef)
+	if len(rawItem) == 0 {
+		return CartMutation{}, fmt.Errorf("ubereats: cart item %q not found", cartItemRef)
+	}
+	itemPayload := cartLineFromRawItem(rawItem)
+	if update.Quantity != nil {
+		itemPayload["quantity"] = *update.Quantity
+	}
+	if update.Note != nil {
+		itemPayload["specialInstructions"] = strings.TrimSpace(*update.Note)
+	}
+
+	location, err := c.DefaultLocation(ctx)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	parsed, err := c.post(ctx, c.ordersURL(), c.endpointURL("updateItemInDraftOrderV2"), map[string]any{
+		"draftOrderUUID": detail.Ref,
+		"cartUUID":       detail.CartRef,
+		"item":           itemPayload,
+	}, c.locationHeaders(location))
+	if err != nil {
+		return CartMutation{}, err
+	}
+	itemData, _ := nestedMapValue(parsed, "data")["item"].(map[string]any)
+	if firstStringValue(itemData, "shoppingCartItemUuid", "shoppingCartItemUUID") != cartItemRef {
+		return CartMutation{}, fmt.Errorf("ubereats: updateItemInDraftOrderV2 did not confirm update for cart item %q", cartItemRef)
+	}
+	updatedCart, err := c.GetCart(ctx, detail.Ref)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	updatedItem, ok := findCartItem(updatedCart, cartItemRef)
+	if !ok {
+		return CartMutation{}, fmt.Errorf("ubereats: updateItemInDraftOrderV2 did not apply update for cart item %q", cartItemRef)
+	}
+	if update.Quantity != nil && updatedItem.Quantity != *update.Quantity {
+		return CartMutation{}, fmt.Errorf("ubereats: updateItemInDraftOrderV2 did not apply requested quantity for cart item %q", cartItemRef)
+	}
+	if update.Note != nil && updatedItem.Note != strings.TrimSpace(*update.Note) {
+		return CartMutation{}, fmt.Errorf("ubereats: updateItemInDraftOrderV2 did not apply requested note for cart item %q", cartItemRef)
+	}
+	return CartMutation{Ref: updatedCart.Ref, Updated: true, Cart: &updatedCart}, nil
+}
+
+func (c *Client) UpdateCart(ctx context.Context, ref string, update CartUpdate) (CartMutation, error) {
+	if strings.TrimSpace(update.DeliveryType) == "" && strings.TrimSpace(update.InteractionType) == "" {
+		return CartMutation{}, fmt.Errorf("ubereats: at least one cart field must be updated")
+	}
+	deliveryType, err := normalizeCartDeliveryType(update.DeliveryType)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	detail, err := c.resolveCartDetail(ctx, ref)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	location, err := c.DefaultLocation(ctx)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	_, paymentProfileRef, err := c.selectedProfileContext(ctx)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	payload := updateDraftOrderPayload(detail, location, paymentProfileRef)
+	if deliveryType != "" {
+		payload["deliveryType"] = deliveryType
+	}
+	if interactionType := strings.TrimSpace(update.InteractionType); interactionType != "" {
+		payload["interactionType"] = interactionType
+	}
+	parsed, err := c.post(ctx, c.ordersURL(), c.endpointURL("updateDraftOrderV2"), payload, c.locationHeaders(location))
+	if err != nil {
+		return CartMutation{}, err
+	}
+	data := nestedMapValue(parsed, "data")
+	if len(listOfMaps(data["validationErrors"])) > 0 {
+		return CartMutation{}, fmt.Errorf("ubereats: updateDraftOrderV2 returned validation errors")
+	}
+	draftOrder := nestedMapValue(data, "draftOrder")
+	if deliveryType != "" && firstStringValue(draftOrder, "deliveryType") != deliveryType {
+		return CartMutation{}, fmt.Errorf("ubereats: updateDraftOrderV2 did not apply delivery type %q", deliveryType)
+	}
+	if interactionType := strings.TrimSpace(update.InteractionType); interactionType != "" && firstStringValue(draftOrder, "interactionType") != interactionType {
+		return CartMutation{}, fmt.Errorf("ubereats: updateDraftOrderV2 did not apply interaction type %q", interactionType)
+	}
+	updatedCart, err := c.GetCart(ctx, detail.Ref)
+	if err != nil {
+		return CartMutation{}, err
+	}
+	return CartMutation{Ref: updatedCart.Ref, Updated: true, Cart: &updatedCart}, nil
+}
+
+func (c *Client) createCart(ctx context.Context, storeRef string, items []map[string]any, currencyCode string) (Cart, error) {
+	storeRef = strings.TrimSpace(storeRef)
+	if storeRef == "" {
+		return Cart{}, fmt.Errorf("ubereats: store ref is required")
+	}
+	if len(items) == 0 {
+		return Cart{}, fmt.Errorf("ubereats: cart requires at least one item")
+	}
+
 	location, err := c.DefaultLocation(ctx)
 	if err != nil {
 		return Cart{}, err
@@ -91,38 +298,7 @@ func (c *Client) CreateCartFromItem(ctx context.Context, storeRef, itemRef strin
 		return Cart{}, err
 	}
 
-	parsed, err := c.post(ctx, c.storePageURL(storeRef), c.endpointURL("createDraftOrderV2"), map[string]any{
-		"isMulticart": true,
-		"shoppingCartItems": []any{map[string]any{
-			"uuid":                 item.Ref,
-			"shoppingCartItemUuid": newUUID(),
-			"storeUuid":            storeRef,
-			"sectionUuid":          item.SectionRef,
-			"subsectionUuid":       item.SubsectionRef,
-			"price":                item.PriceMinor,
-			"title":                item.Title,
-			"quantity":             quantity,
-			"customizations":       map[string]any{},
-			"specialInstructions":  note,
-			"itemId":               nil,
-		}},
-		"useCredits":           true,
-		"extraPaymentProfiles": []any{},
-		"promotionOptions": map[string]any{
-			"autoApplyPromotionUUIDs":        []any{},
-			"selectedPromotionInstanceUUIDs": []any{},
-			"skipApplyingPromotion":          false,
-		},
-		"deliveryTime":                map[string]any{"asap": true},
-		"deliveryType":                "ASAP",
-		"currencyCode":                item.CurrencyCode,
-		"interactionType":             selectedInteractionType(instruction),
-		"paymentProfileUUID":          paymentProfileRef,
-		"deliveryAddress":             instructionLocationPayload(location),
-		"checkMultipleDraftOrdersCap": true,
-		"actionMeta":                  map[string]any{"isQuickAdd": false, "numClicks": 0},
-		"businessDetails":             map[string]any{},
-	}, c.locationHeaders(location))
+	parsed, err := c.post(ctx, c.storePageURL(storeRef), c.endpointURL("createDraftOrderV2"), createDraftOrderPayload(items, currencyCode, paymentProfileRef, selectedInteractionType(instruction), location), c.locationHeaders(location))
 	if err != nil {
 		return Cart{}, err
 	}
@@ -137,17 +313,18 @@ func (c *Client) CreateCartFromItem(ctx context.Context, storeRef, itemRef strin
 
 func (c *Client) GetCart(ctx context.Context, ref string) (Cart, error) {
 	ref = strings.TrimSpace(ref)
-	cart, err := c.fetchCart(ctx, ref)
+	detail, err := c.fetchCartDetail(ctx, ref)
 	if err != nil {
 		resolvedRef := c.resolveDraftOrderRef(ctx, ref)
 		if resolvedRef == "" || resolvedRef == ref {
 			return Cart{}, err
 		}
-		cart, err = c.fetchCart(ctx, resolvedRef)
+		detail, err = c.fetchCartDetail(ctx, resolvedRef)
 		if err != nil {
 			return Cart{}, err
 		}
 	}
+	cart := detail.Cart
 	location, err := c.DefaultLocation(ctx)
 	if err == nil {
 		cart.SessionInfo = sessionInfoFromLocation(location)
@@ -236,19 +413,40 @@ func (c *Client) DiscardCart(ctx context.Context, ref string) (CartMutation, err
 	return CartMutation{Ref: cart.Ref, Discarded: true}, nil
 }
 
+func (c *Client) resolveCartDetail(ctx context.Context, ref string) (cartDetail, error) {
+	ref = strings.TrimSpace(ref)
+	detail, err := c.fetchCartDetail(ctx, ref)
+	if err == nil {
+		return detail, nil
+	}
+	resolvedRef := c.resolveDraftOrderRef(ctx, ref)
+	if resolvedRef == "" || resolvedRef == ref {
+		return cartDetail{}, err
+	}
+	return c.fetchCartDetail(ctx, resolvedRef)
+}
+
 func (c *Client) fetchCart(ctx context.Context, ref string) (Cart, error) {
+	detail, err := c.fetchCartDetail(ctx, ref)
+	if err != nil {
+		return Cart{}, err
+	}
+	return detail.Cart, nil
+}
+
+func (c *Client) fetchCartDetail(ctx context.Context, ref string) (cartDetail, error) {
 	parsed, err := c.post(ctx, c.ordersURL(), c.endpointURL("getDraftOrderByUuidV1"), map[string]any{
 		"draftOrderUuid": strings.TrimSpace(ref),
 	}, nil)
 	if err != nil {
-		return Cart{}, err
+		return cartDetail{}, err
 	}
 	data, _ := parsed["data"].(map[string]any)
 	cart, ok := cartFromMap(data)
 	if !ok {
-		return Cart{}, fmt.Errorf("ubereats: cart %q not found", ref)
+		return cartDetail{}, fmt.Errorf("ubereats: cart %q not found", ref)
 	}
-	return cart, nil
+	return cartDetail{Cart: cart, raw: data}, nil
 }
 
 func (c *Client) resolveDraftOrderRef(ctx context.Context, ref string) string {
@@ -351,6 +549,242 @@ func responseIncludesString(v any, want string) bool {
 		}
 	}
 	return false
+}
+
+func responseIncludesMappedString(v any, want string, keys ...string) bool {
+	for _, item := range listOfMaps(v) {
+		if firstStringValue(item, keys...) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func findCartItem(cart Cart, ref string) (CartItem, bool) {
+	for _, item := range cart.Items {
+		if item.Ref == ref {
+			return item, true
+		}
+	}
+	return CartItem{}, false
+}
+
+func normalizeCartDeliveryType(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return "", nil
+	case CartDeliveryTypeRegular, "asap":
+		return "ASAP", nil
+	case CartDeliveryTypePremium, "premium_delivery":
+		return "PREMIUM_DELIVERY", nil
+	default:
+		return "", fmt.Errorf("ubereats: unsupported delivery type %q", value)
+	}
+}
+
+func cartLineFromMenuItem(item ItemDetail, quantity int, note string) map[string]any {
+	return map[string]any{
+		"uuid":                 item.Ref,
+		"shoppingCartItemUuid": newUUID(),
+		"storeUuid":            item.StoreRef,
+		"sectionUuid":          item.SectionRef,
+		"subsectionUuid":       item.SubsectionRef,
+		"price":                item.PriceMinor,
+		"title":                item.Title,
+		"quantity":             quantity,
+		"customizations":       map[string]any{},
+		"specialInstructions":  strings.TrimSpace(note),
+		"itemId":               nil,
+	}
+}
+
+func cartLineFromRawItem(raw map[string]any) map[string]any {
+	line := map[string]any{
+		"uuid":                 firstStringValue(raw, "uuid"),
+		"shoppingCartItemUuid": firstStringValue(raw, "shoppingCartItemUuid", "shoppingCartItemUUID"),
+		"storeUuid":            firstStringValue(raw, "storeUuid", "storeUUID"),
+		"sectionUuid":          firstStringValue(raw, "sectionUuid"),
+		"subsectionUuid":       firstStringValue(raw, "subsectionUuid"),
+		"price":                intValue(raw["price"]),
+		"title":                firstStringValue(raw, "title"),
+		"quantity":             firstNonZeroInt(intValue(raw["quantity"]), 1),
+		"customizations":       mapValue(raw["customizations"]),
+		"specialInstructions":  firstStringValue(raw, "specialInstructions"),
+		"itemId":               raw["itemId"],
+	}
+	if line["customizations"] == nil {
+		line["customizations"] = map[string]any{}
+	}
+	if imageURL := firstStringValue(raw, "imageURL"); imageURL != "" {
+		line["imageURL"] = imageURL
+	}
+	if fulfillmentIssueAction := mapValue(raw["fulfillmentIssueAction"]); len(fulfillmentIssueAction) > 0 {
+		line["fulfillmentIssueAction"] = fulfillmentIssueAction
+	}
+	return line
+}
+
+func createDraftOrderPayload(items []map[string]any, currencyCode, paymentProfileRef, interactionType string, location Location) map[string]any {
+	shoppingCartItems := make([]any, 0, len(items))
+	for _, item := range items {
+		shoppingCartItems = append(shoppingCartItems, item)
+	}
+	payload := map[string]any{
+		"isMulticart": true,
+		"shoppingCartItems": shoppingCartItems,
+		"useCredits":           true,
+		"extraPaymentProfiles": []any{},
+		"promotionOptions": map[string]any{
+			"autoApplyPromotionUUIDs":        []any{},
+			"selectedPromotionInstanceUUIDs": []any{},
+			"skipApplyingPromotion":          false,
+		},
+		"deliveryTime":                map[string]any{"asap": true},
+		"deliveryType":                "ASAP",
+		"currencyCode":                currencyCode,
+		"interactionType":             interactionType,
+		"paymentProfileUUID":          paymentProfileRef,
+		"deliveryAddress":             instructionLocationPayload(location),
+		"checkMultipleDraftOrdersCap": true,
+		"actionMeta":                  map[string]any{"isQuickAdd": false, "numClicks": 0},
+		"businessDetails":             map[string]any{},
+	}
+	return payload
+}
+
+func updateDraftOrderPayload(detail cartDetail, location Location, selectedPaymentProfileRef string) map[string]any {
+	payload := map[string]any{
+		"draftOrderUUID": detail.Ref,
+	}
+	if paymentProfileRef := firstNonEmpty(detail.PaymentProfileRef, selectedPaymentProfileRef); paymentProfileRef != "" {
+		payload["paymentProfileUUID"] = paymentProfileRef
+		payload["paymentProfileSelectionSource"] = "CLIENT_SYSTEM"
+	}
+	if deliveryAddress := mapValue(detail.raw["deliveryAddress"]); len(deliveryAddress) > 0 {
+		payload["deliveryAddress"] = deliveryAddress
+	} else {
+		payload["deliveryAddress"] = instructionLocationPayload(location)
+	}
+	if targetDeliveryTimeRange := mapValue(detail.raw["targetDeliveryTimeRange"]); len(targetDeliveryTimeRange) > 0 {
+		payload["targetDeliveryTimeRange"] = targetDeliveryTimeRange
+	} else if deliveryTime := mapValue(detail.raw["deliveryTime"]); len(deliveryTime) > 0 {
+		payload["targetDeliveryTimeRange"] = deliveryTime
+	} else {
+		payload["targetDeliveryTimeRange"] = map[string]any{"asap": true}
+	}
+	if diningMode := firstStringValue(detail.raw, "diningMode"); diningMode != "" {
+		payload["diningMode"] = diningMode
+	} else {
+		payload["diningMode"] = "DELIVERY"
+	}
+	return payload
+}
+
+func findCartItemPayload(cart map[string]any, cartItemRef string) map[string]any {
+	items := listOfMaps(nestedMapValue(cart, "shoppingCart")["items"])
+	for _, item := range items {
+		if firstStringValue(item, "shoppingCartItemUuid", "shoppingCartItemUUID") == cartItemRef {
+			return item
+		}
+	}
+	return nil
+}
+
+func (c *Client) findOrderSeed(ctx context.Context, ref string) (orderSeed, error) {
+	ref = strings.TrimSpace(uuidFromOrderRef(ref))
+	if ref == "" {
+		return orderSeed{}, fmt.Errorf("ubereats: missing order ref")
+	}
+	location, err := c.DefaultLocation(ctx)
+	if err != nil {
+		return orderSeed{}, err
+	}
+	headers := c.locationHeaders(location)
+	activeBody, activeErr := c.postRaw(ctx, c.ordersURL(), c.endpointURL("getActiveOrdersV1"), map[string]any{
+		"orderUuid":                 nil,
+		"timezone":                  localTimezoneName(),
+		"showAppUpsellIllustration": true,
+		"isDirectTracking":          false,
+	}, headers)
+	if activeErr == nil {
+		if seed, ok := findOrderSeedInBody(activeBody, ref); ok {
+			return seed, nil
+		}
+	}
+	responses, err := c.pastOrderResponses(ctx, 0, headers)
+	if err != nil {
+		return orderSeed{}, err
+	}
+	for _, response := range responses {
+		if seed, ok := findOrderSeedInBody(response.Body, ref); ok {
+			return seed, nil
+		}
+	}
+	if activeErr != nil {
+		return orderSeed{}, activeErr
+	}
+	return orderSeed{}, fmt.Errorf("order %q not found", ref)
+}
+
+func findOrderSeedInBody(body string, ref string) (orderSeed, bool) {
+	var parsed any
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		return orderSeed{}, false
+	}
+	var found orderSeed
+	ok := false
+	walkJSON(parsed, func(m map[string]any) {
+		if ok {
+			return
+		}
+		if firstStringValue(m, "uuid", "orderUuid") == ref {
+			if seed, seedOK := orderSeedFromMap(m); seedOK {
+				found = seed
+				ok = true
+				return
+			}
+		}
+		if baseOrder := nestedMapValue(m, "baseEaterOrder"); len(baseOrder) > 0 && firstStringValue(baseOrder, "uuid") == ref {
+			if seed, seedOK := orderSeedFromMap(baseOrder); seedOK {
+				found = seed
+				ok = true
+			}
+		}
+	})
+	return found, ok
+}
+
+func orderSeedFromMap(m map[string]any) (orderSeed, bool) {
+	shoppingCart := nestedMapValue(m, "shoppingCart")
+	storeRef := firstNonEmpty(firstStringValue(m, "storeUuid"), firstStringValue(shoppingCart, "storeUuid", "storeUUID"))
+	currencyCode := firstNonEmpty(firstStringValue(m, "currencyCode"), firstStringValue(shoppingCart, "currencyCode"))
+	items := listOfMaps(shoppingCart["items"])
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		seedItem := orderSeedItemFromMap(item, storeRef)
+		if len(seedItem) == 0 {
+			continue
+		}
+		out = append(out, seedItem)
+	}
+	if storeRef == "" || len(out) == 0 {
+		return orderSeed{}, false
+	}
+	return orderSeed{
+		StoreRef:     storeRef,
+		CurrencyCode: currencyCode,
+		Items:        out,
+	}, true
+}
+
+func orderSeedItemFromMap(raw map[string]any, defaultStoreRef string) map[string]any {
+	item := cartLineFromRawItem(raw)
+	item["shoppingCartItemUuid"] = newUUID()
+	item["storeUuid"] = firstNonEmpty(firstStringValue(raw, "storeUuid", "storeUUID"), defaultStoreRef)
+	if item["uuid"] == "" || item["storeUuid"] == "" || item["title"] == "" {
+		return nil
+	}
+	return item
 }
 
 func cartSummaryAddress(m map[string]any) string {

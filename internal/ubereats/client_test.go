@@ -925,6 +925,145 @@ func TestClientCreateCartFromItem_UsesCreateDraftOrder(t *testing.T) {
 	}
 }
 
+func TestClientCreateCartFromOrder_UsesPastOrderItems(t *testing.T) {
+	oldNewUUID := newUUID
+	uuidValues := []string{"line-uuid-1", "line-uuid-2"}
+	newUUID = func() string {
+		value := uuidValues[0]
+		uuidValues = uuidValues[1:]
+		return value
+	}
+	t.Cleanup(func() { newUUID = oldNewUUID })
+
+	var createPayload map[string]any
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getInstructionForLocationV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"preferredInteractionType":"leave_at_door","defaultInteractionType":"door_to_door","selectedInstruction":{"interactionType":"leave_at_door"}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"selectedProfile":{"name":"Personal","defaultPaymentProfileUuid":"payment-1"}}}`), nil
+				case "/_p/api/getActiveOrdersV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"orders":[]}}`), nil
+				case "/_p/api/getPastOrdersV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"ordersMap":{
+								"order-1":{
+									"baseEaterOrder":{
+										"uuid":"order-1",
+										"storeUuid":"store-1",
+										"currencyCode":"USD",
+										"shoppingCart":{
+											"items":[
+												{"uuid":"item-1","shoppingCartItemUuid":"old-1","storeUuid":"store-1","sectionUuid":"section-1","subsectionUuid":"subsection-1","price":399,"title":"Gummy Bears","quantity":2,"specialInstructions":"red only","customizations":{}},
+												{"uuid":"item-2","shoppingCartItemUuid":"old-2","storeUuid":"store-1","sectionUuid":"section-2","subsectionUuid":"subsection-2","price":250,"title":"Cola","quantity":1,"specialInstructions":"","customizations":{"addon":[{"uuid":"opt-1","quantity":1}]}}
+											]
+										}
+									}
+								}
+							},
+							"orderUuids":["order-1"],
+							"paginationData":{"nextCursor":""}
+						}
+					}`), nil
+				case "/_p/api/createDraftOrderV2":
+					rawBody, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("read create body: %v", err)
+					}
+					if err := json.Unmarshal(rawBody, &createPayload); err != nil {
+						t.Fatalf("unmarshal create body: %v body=%s", err, string(rawBody))
+					}
+					return jsonResponse(t, 200, `{"status":"success","data":{"draftOrder":{"uuid":"draft-1"}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"uuid":"draft-1",
+							"state":"UNORDERED",
+							"storeUuid":"store-1",
+							"deliveryType":"ASAP",
+							"interactionType":"leave_at_door",
+							"paymentProfileUUID":"payment-1",
+							"shoppingCart":{
+								"cartUuid":"cart-1",
+								"currencyCode":"USD",
+								"isActive":true,
+								"items":[
+									{"shoppingCartItemUuid":"line-uuid-1","uuid":"item-1","title":"Gummy Bears","quantity":2,"price":399,"totalPrice":798,"specialInstructions":"red only"},
+									{"shoppingCartItemUuid":"line-uuid-2","uuid":"item-2","title":"Cola","quantity":1,"price":250,"totalPrice":250}
+								]
+							}
+						}
+					}`), nil
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","title":"CVS","tagline1":{"text":"Subtotal: $10.48"},"tagline2":{"text":"Deliver to 222 E 39th St"},"itemCount":3,"action":"OPEN_CHECKOUT"}]}}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	cart, err := client.CreateCartFromOrder(context.Background(), "order-1")
+	if err != nil {
+		t.Fatalf("CreateCartFromOrder: %v", err)
+	}
+	if cart.Ref != "draft-1" || cart.ItemCount != 3 || cart.Subtotal != "$10.48" {
+		t.Fatalf("cart=%+v", cart)
+	}
+	items, _ := createPayload["shoppingCartItems"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("createPayload=%v", createPayload)
+	}
+	item1, _ := items[0].(map[string]any)
+	item2, _ := items[1].(map[string]any)
+	if item1["shoppingCartItemUuid"] != "line-uuid-1" || item1["quantity"] != float64(2) || item1["specialInstructions"] != "red only" {
+		t.Fatalf("item1 payload=%v", item1)
+	}
+	if item2["shoppingCartItemUuid"] != "line-uuid-2" {
+		t.Fatalf("item2 payload=%v", item2)
+	}
+	if createPayload["paymentProfileUUID"] != "payment-1" || createPayload["interactionType"] != "leave_at_door" {
+		t.Fatalf("createPayload=%v", createPayload)
+	}
+}
+
+func TestClientCreateCartFromOrder_ReturnsActiveLookupErrorWhenPastLookupMisses(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getActiveOrdersV1":
+					return jsonResponse(t, 500, `{"status":"failure"}`), nil
+				case "/_p/api/getPastOrdersV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"ordersMap":{},"orderUuids":[],"paginationData":{"nextCursor":""}}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	_, err := client.CreateCartFromOrder(context.Background(), "order-1")
+	if err == nil || !strings.Contains(err.Error(), "getActiveOrdersV1") {
+		t.Fatalf("unexpected err=%v", err)
+	}
+}
+
 func TestClientCreateCartFromItem_RejectsNonPositiveQuantity(t *testing.T) {
 	client := &Client{}
 	_, err := client.CreateCartFromItem(context.Background(), "store-1", "item-1", 0, "")
@@ -1022,6 +1161,274 @@ func TestClientRemoveCartItem_RemovesAndDetectsCollapsedCart(t *testing.T) {
 	}
 	if !result.Removed || result.Ref != "draft-1" || result.Cart != nil {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestClientAddCartItem_UsesAddItemsEndpoint(t *testing.T) {
+	oldNewUUID := newUUID
+	newUUID = func() string { return "line-uuid-2" }
+	t.Cleanup(func() { newUUID = oldNewUUID })
+
+	var addPayload map[string]any
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"CVS","itemCount":1}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"uuid":"draft-1",
+							"state":"UNORDERED",
+							"storeUuid":"store-1",
+							"deliveryType":"ASAP",
+							"interactionType":"leave_at_door",
+							"shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[
+								{"shoppingCartItemUuid":"line-1","uuid":"item-1","title":"Gummy Bears","quantity":1,"price":399}
+							]}
+						}
+					}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getStoreV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"title":"CVS",
+							"uuid":"store-1",
+							"currencyCode":"USD",
+							"isOrderable":true,
+							"sections":[{"uuid":"section-2","title":"Drinks","subsectionUuids":["subsection-2"]}],
+							"catalogSectionsMap":{
+								"section-2":[{"payload":{"standardItemsPayload":{"catalogItems":[{"uuid":"item-2","sectionUuid":"section-2","subsectionUuid":"subsection-2","title":"Cola","price":250,"hasCustomizations":false}]}}}]
+							}
+						}
+					}`), nil
+				case "/_p/api/getMenuItemV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"uuid":"item-2","title":"Cola","sectionUuid":"section-2","subsectionUuid":"subsection-2","price":250,"hasCustomizations":false,"customizationsList":[]}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{}}`), nil
+				case "/_p/api/addItemsToDraftOrderV2":
+					rawBody, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("read add body: %v", err)
+					}
+					if err := json.Unmarshal(rawBody, &addPayload); err != nil {
+						t.Fatalf("unmarshal add body: %v body=%s", err, string(rawBody))
+					}
+					return jsonResponse(t, 200, `{"status":"success","data":{"addedItems":[{"uuid":"item-2","shoppingCartItemUuid":"line-uuid-2"}],"draftOrderUUID":"draft-1","draftOrderPresentationResponse":{}}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	result, err := client.AddCartItem(context.Background(), "draft-1", "item-2", 2, "cold")
+	if err != nil {
+		t.Fatalf("AddCartItem: %v", err)
+	}
+	if !result.Added || result.Cart == nil || result.Cart.ItemCount != 1 {
+		t.Fatalf("result=%+v", result)
+	}
+	items, _ := addPayload["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("addPayload=%v", addPayload)
+	}
+	item, _ := items[0].(map[string]any)
+	if item["shoppingCartItemUuid"] != "line-uuid-2" || item["quantity"] != float64(2) || item["specialInstructions"] != "cold" {
+		t.Fatalf("item payload=%v", item)
+	}
+}
+
+func TestClientAddCartItem_ErrorsWhenResponseDoesNotConfirmAddedItem(t *testing.T) {
+	oldNewUUID := newUUID
+	newUUID = func() string { return "line-uuid-2" }
+	t.Cleanup(func() { newUUID = oldNewUUID })
+
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"CVS","itemCount":1}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"uuid":"draft-1","storeUuid":"store-1","shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","title":"Gummy Bears","quantity":1,"price":399}]}}}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getStoreV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"title":"CVS","uuid":"store-1","currencyCode":"USD","isOrderable":true,"sections":[{"uuid":"section-2","title":"Drinks","subsectionUuids":["subsection-2"]}],"catalogSectionsMap":{"section-2":[{"payload":{"standardItemsPayload":{"catalogItems":[{"uuid":"item-2","sectionUuid":"section-2","subsectionUuid":"subsection-2","title":"Cola","price":250,"hasCustomizations":false}]}}}]}}}`), nil
+				case "/_p/api/getMenuItemV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"uuid":"item-2","title":"Cola","sectionUuid":"section-2","subsectionUuid":"subsection-2","price":250,"hasCustomizations":false,"customizationsList":[]}}`), nil
+				case "/_p/api/addItemsToDraftOrderV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"addedItems":[{"uuid":"item-2","shoppingCartItemUuid":"other-line"}],"draftOrderUUID":"draft-1","draftOrderPresentationResponse":{}}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	_, err := client.AddCartItem(context.Background(), "draft-1", "item-2", 2, "cold")
+	if err == nil || !strings.Contains(err.Error(), "did not confirm added item") {
+		t.Fatalf("unexpected err=%v", err)
+	}
+}
+
+func TestClientUpdateCartItem_UsesExistingLinePayload(t *testing.T) {
+	var updatePayload map[string]any
+	var draftReads int
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"CVS","itemCount":1}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					draftReads++
+					if draftReads == 1 {
+						return jsonResponse(t, 200, `{
+							"status":"success",
+							"data":{
+								"uuid":"draft-1",
+								"state":"UNORDERED",
+								"storeUuid":"store-1",
+								"deliveryType":"ASAP",
+								"interactionType":"leave_at_door",
+								"shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[
+									{"shoppingCartItemUuid":"line-1","uuid":"item-1","storeUuid":"store-1","sectionUuid":"section-1","subsectionUuid":"subsection-1","title":"Gummy Bears","quantity":1,"price":399,"specialInstructions":"old note","customizations":{"addon":[{"uuid":"opt-1","quantity":1}]}}
+								]}
+							}
+						}`), nil
+					}
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"uuid":"draft-1",
+							"state":"UNORDERED",
+							"storeUuid":"store-1",
+							"deliveryType":"ASAP",
+							"interactionType":"leave_at_door",
+							"shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[
+								{"shoppingCartItemUuid":"line-1","uuid":"item-1","storeUuid":"store-1","sectionUuid":"section-1","subsectionUuid":"subsection-1","title":"Gummy Bears","quantity":3,"price":399,"specialInstructions":"less ice","customizations":{"addon":[{"uuid":"opt-1","quantity":1}]}}
+							]}
+						}
+					}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/updateItemInDraftOrderV2":
+					rawBody, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("read update body: %v", err)
+					}
+					if err := json.Unmarshal(rawBody, &updatePayload); err != nil {
+						t.Fatalf("unmarshal update body: %v body=%s", err, string(rawBody))
+					}
+					return jsonResponse(t, 200, `{"status":"success","data":{"item":{"uuid":"item-1","shoppingCartItemUuid":"line-1","quantity":3},"draftOrderUUID":"draft-1","draftOrderPresentationResponse":{}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	quantity := 3
+	note := "less ice"
+	result, err := client.UpdateCartItem(context.Background(), "draft-1", "line-1", CartItemUpdate{Quantity: &quantity, Note: &note})
+	if err != nil {
+		t.Fatalf("UpdateCartItem: %v", err)
+	}
+	if !result.Updated || result.Cart == nil || result.Cart.Ref != "draft-1" {
+		t.Fatalf("result=%+v", result)
+	}
+	item, _ := updatePayload["item"].(map[string]any)
+	if item["quantity"] != float64(3) || item["specialInstructions"] != "less ice" {
+		t.Fatalf("item payload=%v", item)
+	}
+	customizations, _ := item["customizations"].(map[string]any)
+	if len(customizations) == 0 {
+		t.Fatalf("item payload=%v", item)
+	}
+}
+
+func TestClientUpdateCartItem_ErrorsWhenResponseDoesNotConfirmUpdatedItem(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"CVS","itemCount":1}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"uuid":"draft-1","storeUuid":"store-1","shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","storeUuid":"store-1","sectionUuid":"section-1","subsectionUuid":"subsection-1","title":"Gummy Bears","quantity":1,"price":399,"customizations":{}}]}}}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/updateItemInDraftOrderV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"item":{"uuid":"item-1","shoppingCartItemUuid":"other-line","quantity":3},"draftOrderUUID":"draft-1","draftOrderPresentationResponse":{}}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	quantity := 3
+	_, err := client.UpdateCartItem(context.Background(), "draft-1", "line-1", CartItemUpdate{Quantity: &quantity})
+	if err == nil || !strings.Contains(err.Error(), "did not confirm update") {
+		t.Fatalf("unexpected err=%v", err)
+	}
+}
+
+func TestClientUpdateCartItem_ErrorsWhenUpdatedCartDoesNotReflectRequestedFields(t *testing.T) {
+	var draftReads int
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"CVS","itemCount":1}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					draftReads++
+					if draftReads == 1 {
+						return jsonResponse(t, 200, `{"status":"success","data":{"uuid":"draft-1","storeUuid":"store-1","shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","storeUuid":"store-1","sectionUuid":"section-1","subsectionUuid":"subsection-1","title":"Gummy Bears","quantity":1,"price":399,"specialInstructions":"old note","customizations":{}}]}}}`), nil
+					}
+					return jsonResponse(t, 200, `{"status":"success","data":{"uuid":"draft-1","storeUuid":"store-1","shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","storeUuid":"store-1","sectionUuid":"section-1","subsectionUuid":"subsection-1","title":"Gummy Bears","quantity":1,"price":399,"specialInstructions":"old note","customizations":{}}]}}}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{}}`), nil
+				case "/_p/api/updateItemInDraftOrderV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"item":{"uuid":"item-1","shoppingCartItemUuid":"line-1","quantity":3},"draftOrderUUID":"draft-1","draftOrderPresentationResponse":{}}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	quantity := 3
+	note := "less ice"
+	_, err := client.UpdateCartItem(context.Background(), "draft-1", "line-1", CartItemUpdate{Quantity: &quantity, Note: &note})
+	if err == nil || !strings.Contains(err.Error(), "did not apply") {
+		t.Fatalf("unexpected err=%v", err)
 	}
 }
 
@@ -1194,6 +1601,174 @@ func TestClientDiscardCart_UsesDiscardEndpoint(t *testing.T) {
 	}
 	if !result.Discarded || result.Ref != "draft-1" {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestClientUpdateCart_UsesUpdateDraftOrder(t *testing.T) {
+	var updatePayload map[string]any
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"CVS","itemCount":1}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"uuid":"draft-1",
+							"state":"UNORDERED",
+							"storeUuid":"store-1",
+							"deliveryType":"ASAP",
+							"interactionType":"door_to_door",
+							"paymentProfileUUID":"payment-1",
+							"shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","title":"Gummy Bears","quantity":1,"price":399}]}
+						}
+					}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.748198,"longitude":-73.9746683}}}]}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"selectedProfile":{"name":"Personal","defaultPaymentProfileUuid":"payment-1"}}}`), nil
+				case "/_p/api/updateDraftOrderV2":
+					rawBody, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("read update draft body: %v", err)
+					}
+					if err := json.Unmarshal(rawBody, &updatePayload); err != nil {
+						t.Fatalf("unmarshal update draft body: %v body=%s", err, string(rawBody))
+					}
+					return jsonResponse(t, 200, `{"status":"success","data":{"draftOrder":{"uuid":"draft-1","deliveryType":"PREMIUM_DELIVERY","interactionType":"leave_at_door"},"validationErrors":null}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	result, err := client.UpdateCart(context.Background(), "draft-1", CartUpdate{
+		DeliveryType:    CartDeliveryTypePremium,
+		InteractionType: "leave_at_door",
+	})
+	if err != nil {
+		t.Fatalf("UpdateCart: %v", err)
+	}
+	if !result.Updated || result.Cart == nil || result.Cart.Ref != "draft-1" {
+		t.Fatalf("result=%+v", result)
+	}
+	if updatePayload["deliveryType"] != "PREMIUM_DELIVERY" || updatePayload["interactionType"] != "leave_at_door" || updatePayload["paymentProfileUUID"] != "payment-1" {
+		t.Fatalf("updatePayload=%v", updatePayload)
+	}
+	if _, ok := updatePayload["deliveryAddress"].(map[string]any); !ok {
+		t.Fatalf("updatePayload=%v", updatePayload)
+	}
+}
+
+func TestClientUpdateCart_PreservesExistingCartContext(t *testing.T) {
+	var updatePayload map[string]any
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"CVS","itemCount":1}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"uuid":"draft-1",
+							"state":"UNORDERED",
+							"storeUuid":"store-1",
+							"deliveryType":"ASAP",
+							"diningMode":"PICKUP",
+							"interactionType":"door_to_door",
+							"paymentProfileUUID":"payment-existing",
+							"deliveryAddress":{"fullAddress":"Saved Address"},
+							"targetDeliveryTimeRange":{"scheduled":true,"startTime":"2026-04-14T12:00:00Z","endTime":"2026-04-14T12:30:00Z"},
+							"shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","title":"Gummy Bears","quantity":1,"price":399}]}
+						}
+					}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.748198,"longitude":-73.9746683}}}]}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"selectedProfile":{"name":"Personal","defaultPaymentProfileUuid":"payment-default"}}}`), nil
+				case "/_p/api/updateDraftOrderV2":
+					rawBody, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("read update draft body: %v", err)
+					}
+					if err := json.Unmarshal(rawBody, &updatePayload); err != nil {
+						t.Fatalf("unmarshal update draft body: %v body=%s", err, string(rawBody))
+					}
+					return jsonResponse(t, 200, `{"status":"success","data":{"draftOrder":{"uuid":"draft-1","deliveryType":"ASAP","interactionType":"leave_at_door"},"validationErrors":null}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	result, err := client.UpdateCart(context.Background(), "draft-1", CartUpdate{
+		InteractionType: "leave_at_door",
+	})
+	if err != nil {
+		t.Fatalf("UpdateCart: %v", err)
+	}
+	if !result.Updated || result.Cart == nil || result.Cart.Ref != "draft-1" {
+		t.Fatalf("result=%+v", result)
+	}
+	if updatePayload["paymentProfileUUID"] != "payment-existing" {
+		t.Fatalf("updatePayload=%v", updatePayload)
+	}
+	if updatePayload["diningMode"] != "PICKUP" {
+		t.Fatalf("updatePayload=%v", updatePayload)
+	}
+	deliveryAddress, _ := updatePayload["deliveryAddress"].(map[string]any)
+	if deliveryAddress["fullAddress"] != "Saved Address" {
+		t.Fatalf("updatePayload=%v", updatePayload)
+	}
+	targetDeliveryTimeRange, _ := updatePayload["targetDeliveryTimeRange"].(map[string]any)
+	if scheduled, _ := targetDeliveryTimeRange["scheduled"].(bool); !scheduled {
+		t.Fatalf("updatePayload=%v", updatePayload)
+	}
+	if updatePayload["interactionType"] != "leave_at_door" {
+		t.Fatalf("updatePayload=%v", updatePayload)
+	}
+}
+
+func TestClientUpdateCart_ErrorsWhenValidationErrorsAreReturned(t *testing.T) {
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=abc; auth=xyz",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch req.URL.Path {
+				case "/_p/api/getCartsViewForEaterUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"cartsView":{"carts":[{"draftOrderUUID":"draft-1","cartUUID":"cart-1","title":"CVS","itemCount":1}]}}}`), nil
+				case "/_p/api/getDraftOrderByUuidV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"uuid":"draft-1","state":"UNORDERED","storeUuid":"store-1","deliveryType":"ASAP","interactionType":"door_to_door","paymentProfileUUID":"payment-1","shoppingCart":{"cartUuid":"cart-1","currencyCode":"USD","isActive":true,"items":[{"shoppingCartItemUuid":"line-1","uuid":"item-1","title":"Gummy Bears","quantity":1,"price":399}]}}}`), nil
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.748198,"longitude":-73.9746683}}}]}}}`), nil
+				case "/_p/api/getProfilesForUserV1":
+					return jsonResponse(t, 200, `{"status":"success","data":{"selectedProfile":{"name":"Personal","defaultPaymentProfileUuid":"payment-1"}}}`), nil
+				case "/_p/api/updateDraftOrderV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"draftOrder":{"uuid":"draft-1","deliveryType":"ASAP","interactionType":"door_to_door"},"validationErrors":[{"code":"bad_request"}]}}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	_, err := client.UpdateCart(context.Background(), "draft-1", CartUpdate{DeliveryType: CartDeliveryTypePremium})
+	if err == nil || !strings.Contains(err.Error(), "validation errors") {
+		t.Fatalf("unexpected err=%v", err)
 	}
 }
 
