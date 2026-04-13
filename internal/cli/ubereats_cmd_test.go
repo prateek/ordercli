@@ -29,6 +29,9 @@ type fakeUberEatsClient struct {
 	getMenuItem           func(context.Context, string, string) (ubereats.ItemDetail, error)
 	listCarts             func(context.Context, int) ([]ubereats.Cart, error)
 	getCart               func(context.Context, string) (ubereats.Cart, error)
+	createCartFromItem    func(context.Context, string, string, int, string) (ubereats.Cart, error)
+	removeCartItem        func(context.Context, string, string) (ubereats.CartMutation, error)
+	discardCart           func(context.Context, string) (ubereats.CartMutation, error)
 }
 
 func (f fakeUberEatsClient) SetCookieHeader(string) {}
@@ -91,6 +94,18 @@ func (f fakeUberEatsClient) ListCarts(ctx context.Context, limit int) ([]ubereat
 
 func (f fakeUberEatsClient) GetCart(ctx context.Context, ref string) (ubereats.Cart, error) {
 	return f.getCart(ctx, ref)
+}
+
+func (f fakeUberEatsClient) CreateCartFromItem(ctx context.Context, storeRef, itemRef string, quantity int, note string) (ubereats.Cart, error) {
+	return f.createCartFromItem(ctx, storeRef, itemRef, quantity, note)
+}
+
+func (f fakeUberEatsClient) RemoveCartItem(ctx context.Context, ref, cartItemRef string) (ubereats.CartMutation, error) {
+	return f.removeCartItem(ctx, ref, cartItemRef)
+}
+
+func (f fakeUberEatsClient) DiscardCart(ctx context.Context, ref string) (ubereats.CartMutation, error) {
+	return f.discardCart(ctx, ref)
 }
 
 func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
@@ -684,6 +699,106 @@ func TestUberEatsCLI_CartsListShow(t *testing.T) {
 	}
 	if !strings.Contains(out, `"ref": "draft-1"`) || !strings.Contains(out, `"payment_profile_ref": "payment-1"`) || !strings.Contains(out, `"checkout_ready": true`) || !strings.Contains(out, `"fee_summary": "Fees $1.25"`) {
 		t.Fatalf("unexpected carts show out=%s", out)
+	}
+}
+
+func TestUberEatsCLI_CartsCreateRemoveDiscard(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	oldFactory := uberEatsClientFactory
+	t.Cleanup(func() { uberEatsClientFactory = oldFactory })
+	uberEatsClientFactory = func(st *state, _ uberEatsCommand) uberEatsClient {
+		return fakeUberEatsClient{
+			createCartFromItem: func(_ context.Context, storeRef, itemRef string, quantity int, note string) (ubereats.Cart, error) {
+				if storeRef != "store-1" || itemRef != "item-1" || quantity != 2 || note != "red only" {
+					t.Fatalf("create args store=%q item=%q quantity=%d note=%q", storeRef, itemRef, quantity, note)
+				}
+				return ubereats.Cart{
+					Ref:           "draft-1",
+					StoreTitle:    "CVS",
+					ItemCount:     2,
+					Subtotal:      "$7.98",
+					CheckoutReady: true,
+				}, nil
+			},
+			removeCartItem: func(_ context.Context, ref, cartItemRef string) (ubereats.CartMutation, error) {
+				if ref != "draft-1" || cartItemRef != "line-1" {
+					t.Fatalf("remove args ref=%q cartItemRef=%q", ref, cartItemRef)
+				}
+				return ubereats.CartMutation{Ref: "draft-1", Removed: true}, nil
+			},
+			discardCart: func(_ context.Context, ref string) (ubereats.CartMutation, error) {
+				if ref != "draft-1" {
+					t.Fatalf("discard ref=%q", ref)
+				}
+				return ubereats.CartMutation{Ref: "draft-1", Discarded: true}, nil
+			},
+		}
+	}
+
+	out, _, err := runCLI(cfgPath, []string{"ubereats", "carts", "create", "--store", "store-1", "--item", "item-1", "--quantity", "2", "--note", "red only"}, "")
+	if err != nil {
+		t.Fatalf("carts create: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "ref=draft-1") || !strings.Contains(out, "checkout_ready=true") {
+		t.Fatalf("unexpected carts create out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "carts", "items", "remove", "draft-1", "line-1", "--json"}, "")
+	if err != nil {
+		t.Fatalf("carts items remove: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, `"removed": true`) || !strings.Contains(out, `"ref": "draft-1"`) {
+		t.Fatalf("unexpected carts items remove out=%s", out)
+	}
+
+	out, _, err = runCLI(cfgPath, []string{"ubereats", "carts", "discard", "draft-1"}, "")
+	if err != nil {
+		t.Fatalf("carts discard: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "ref=draft-1") || !strings.Contains(out, "discarded=true") {
+		t.Fatalf("unexpected carts discard out=%s", out)
+	}
+}
+
+func TestUberEatsCLI_CartsItemsRemoveTextReportsMutationAndUpdatedCart(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	oldFactory := uberEatsClientFactory
+	t.Cleanup(func() { uberEatsClientFactory = oldFactory })
+	uberEatsClientFactory = func(st *state, _ uberEatsCommand) uberEatsClient {
+		return fakeUberEatsClient{
+			removeCartItem: func(_ context.Context, ref, cartItemRef string) (ubereats.CartMutation, error) {
+				if ref != "draft-1" || cartItemRef != "line-1" {
+					t.Fatalf("remove args ref=%q cartItemRef=%q", ref, cartItemRef)
+				}
+				return ubereats.CartMutation{
+					Ref:     "draft-1",
+					Removed: true,
+					Cart: &ubereats.Cart{
+						Ref:           "draft-1",
+						StoreTitle:    "CVS",
+						ItemCount:     1,
+						Subtotal:      "$2.50",
+						CheckoutReady: true,
+					},
+				}, nil
+			},
+		}
+	}
+
+	out, _, err := runCLI(cfgPath, []string{"ubereats", "carts", "items", "remove", "draft-1", "line-1"}, "")
+	if err != nil {
+		t.Fatalf("carts items remove: %v out=%s", err, out)
+	}
+	if !strings.Contains(out, "ref=draft-1 removed=true") || !strings.Contains(out, "checkout_ready=true") {
+		t.Fatalf("unexpected carts items remove out=%s", out)
+	}
+}
+
+func TestUberEatsCLI_CartsCreateRejectsUnexpectedArgs(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	out, _, err := runCLI(cfgPath, []string{"ubereats", "carts", "create", "junk", "--store", "store-1", "--item", "item-1"}, "")
+	if err == nil || !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("unexpected err=%v out=%s", err, out)
 	}
 }
 

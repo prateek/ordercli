@@ -226,6 +226,9 @@ func newUberEatsCartsCmd(st *state) *cobra.Command {
 	}
 	cmd.AddCommand(newUberEatsCartsListCmd(st))
 	cmd.AddCommand(newUberEatsCartsShowCmd(st))
+	cmd.AddCommand(newUberEatsCartsCreateCmd(st))
+	cmd.AddCommand(newUberEatsCartsDiscardCmd(st))
+	cmd.AddCommand(newUberEatsCartItemsCmd(st))
 	return cmd
 }
 
@@ -262,6 +265,82 @@ func newUberEatsCartsShowCmd(st *state) *cobra.Command {
 				return err
 			}
 			return writeUberEatsCart(cmd.OutOrStdout(), cart, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	return cmd
+}
+
+func newUberEatsCartsCreateCmd(st *state) *cobra.Command {
+	var asJSON bool
+	var storeRef string
+	var itemRef string
+	var quantity int
+	var note string
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "Create one Uber Eats draft cart from a store item",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			cart, err := client.CreateCartFromItem(cmd.Context(), storeRef, itemRef, quantity, note)
+			if err != nil {
+				return err
+			}
+			return writeUberEatsCart(cmd.OutOrStdout(), cart, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	cmd.Flags().StringVar(&storeRef, "store", "", "store ref")
+	cmd.Flags().StringVar(&itemRef, "item", "", "item ref")
+	cmd.Flags().IntVar(&quantity, "quantity", 1, "item quantity")
+	cmd.Flags().StringVar(&note, "note", "", "special instructions")
+	_ = cmd.MarkFlagRequired("store")
+	_ = cmd.MarkFlagRequired("item")
+	return cmd
+}
+
+func newUberEatsCartsDiscardCmd(st *state) *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "discard <cart-ref>",
+		Short: "Discard one Uber Eats draft cart",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			result, err := client.DiscardCart(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			return writeUberEatsCartMutation(cmd.OutOrStdout(), result, asJSON)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
+	return cmd
+}
+
+func newUberEatsCartItemsCmd(st *state) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "items",
+		Short: "Mutate Uber Eats cart items",
+	}
+	cmd.AddCommand(newUberEatsCartItemsRemoveCmd(st))
+	return cmd
+}
+
+func newUberEatsCartItemsRemoveCmd(st *state) *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "remove <cart-ref> <cart-item-ref>",
+		Short: "Remove one item from an Uber Eats draft cart",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			client := uberEatsClientFactory(st, uberEatsCommand{})
+			result, err := client.RemoveCartItem(cmd.Context(), args[0], args[1])
+			if err != nil {
+				return err
+			}
+			return writeUberEatsCartMutation(cmd.OutOrStdout(), result, asJSON)
 		},
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print JSON")
@@ -811,6 +890,36 @@ func writeUberEatsCart(w io.Writer, cart ubereats.Cart, asJSON bool) error {
 	}
 	_, err := fmt.Fprintln(w, strings.Join(lines, "\n"))
 	return err
+}
+
+func writeUberEatsCartMutation(w io.Writer, result ubereats.CartMutation, asJSON bool) error {
+	if asJSON {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]any{
+			"ok": true,
+			"data": map[string]any{
+				"item": result,
+			},
+			"meta": map[string]any{
+				"provider": "ubereats",
+			},
+		})
+	}
+	parts := []string{"ref=" + result.Ref}
+	if result.Removed {
+		parts = append(parts, "removed=true")
+	}
+	if result.Discarded {
+		parts = append(parts, "discarded=true")
+	}
+	if _, err := fmt.Fprintln(w, strings.Join(parts, " ")); err != nil {
+		return err
+	}
+	if result.Cart != nil {
+		return writeUberEatsCart(w, *result.Cart, false)
+	}
+	return nil
 }
 
 func writeUberEatsStore(w io.Writer, store ubereats.Store, asJSON bool) error {
