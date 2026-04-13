@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -59,11 +60,20 @@ type Client struct {
 	BaseURL      string
 	ProfileDir   string
 	CookieHeader string
+	cookieValues map[string]string
 	UserAgent    string
 	LogWriter    io.Writer
 	Timeout      time.Duration
 	HTTPClient   *http.Client
 	ReadSession  func(context.Context, string, browserpage.Options) (browserpage.SessionResult, error)
+}
+
+var uberEatsSessionCookieNames = map[string]struct{}{
+	"_userUuid":         {},
+	"jwt-session":       {},
+	"sid":               {},
+	"uev2.id.session":   {},
+	"uev2.id.session_v2": {},
 }
 
 func NewClient(baseURL, profileDir, userAgent string, logWriter io.Writer) *Client {
@@ -79,6 +89,7 @@ func NewClient(baseURL, profileDir, userAgent string, logWriter io.Writer) *Clie
 
 func (c *Client) SetCookieHeader(cookieHeader string) {
 	c.CookieHeader = strings.TrimSpace(cookieHeader)
+	c.replaceCookies(c.CookieHeader)
 }
 
 func (c *Client) CheckSession(ctx context.Context) (Session, error) {
@@ -279,7 +290,7 @@ func (c *Client) postRaw(ctx context.Context, pageURL, requestURL string, body a
 		req.Header.Set(key, value)
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Cookie", c.CookieHeader)
+	req.Header.Set("Cookie", c.currentCookieHeader())
 	req.Header.Set("Origin", c.BaseURL)
 	req.Header.Set("Referer", pageURL)
 	if c.UserAgent != "" {
@@ -297,6 +308,7 @@ func (c *Client) postRaw(ctx context.Context, pageURL, requestURL string, body a
 		return "", err
 	}
 	bodyText := string(bodyBytes)
+	c.mergeResponseCookies(resp)
 	c.traceRequest(requestURL, payload, req.Header, resp.StatusCode, bodyText)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("ubereats: %s status %d", requestURL, resp.StatusCode)
@@ -400,14 +412,23 @@ func (c *Client) timeout() time.Duration {
 
 func (c *Client) httpClient() *http.Client {
 	if c.HTTPClient != nil {
+		if c.HTTPClient.Timeout <= 0 {
+			c.HTTPClient.Timeout = c.timeout()
+		}
 		return c.HTTPClient
 	}
 	return &http.Client{Timeout: c.timeout()}
 }
 
 func (c *Client) ensureSession(ctx context.Context) error {
-	if strings.TrimSpace(c.CookieHeader) != "" {
+	if c.hasSessionCookies() {
 		return nil
+	}
+	if strings.TrimSpace(c.CookieHeader) != "" {
+		c.replaceCookies(c.CookieHeader)
+		if c.hasSessionCookies() {
+			return nil
+		}
 	}
 	if strings.TrimSpace(c.ProfileDir) == "" {
 		return errors.New("ubereats: missing browser profile (run `ordercli ubereats login`)")
@@ -423,16 +444,113 @@ func (c *Client) ensureSession(ctx context.Context) error {
 		WaitForURLSubstrings: []string{"/orders"},
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("ubereats: could not refresh session from browser profile; run `ordercli ubereats login`: %w", err)
 	}
 	c.CookieHeader = strings.TrimSpace(res.CookieHeader)
 	if c.CookieHeader == "" {
-		return errors.New("ubereats: browser profile did not produce session cookies")
+		return errors.New("ubereats: browser profile did not produce session cookies; run `ordercli ubereats login`")
+	}
+	c.replaceCookies(c.CookieHeader)
+	if !c.hasSessionCookies() {
+		return errors.New("ubereats: browser profile did not produce usable session cookies; run `ordercli ubereats login`")
 	}
 	if c.UserAgent == "" {
 		c.UserAgent = strings.TrimSpace(res.UserAgent)
 	}
 	return nil
+}
+
+func (c *Client) hasSessionCookies() bool {
+	if len(c.cookieValues) == 0 && strings.TrimSpace(c.CookieHeader) != "" {
+		c.replaceCookies(c.CookieHeader)
+	}
+	for name, value := range c.cookieValues {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		if _, ok := uberEatsSessionCookieNames[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) seedCookies(cookieHeader string) {
+	cookieHeader = strings.TrimSpace(cookieHeader)
+	if cookieHeader == "" {
+		return
+	}
+	if c.cookieValues == nil {
+		c.cookieValues = map[string]string{}
+	}
+	parts := strings.Split(cookieHeader, ";")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, value, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		value = strings.Trim(strings.TrimSpace(value), `"`)
+		c.cookieValues[name] = value
+	}
+}
+
+func (c *Client) replaceCookies(cookieHeader string) {
+	c.cookieValues = map[string]string{}
+	c.seedCookies(cookieHeader)
+}
+
+func (c *Client) currentCookieHeader() string {
+	if c.cookieValues == nil {
+		return strings.TrimSpace(c.CookieHeader)
+	}
+	if len(c.cookieValues) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(c.cookieValues))
+	for name := range c.cookieValues {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, name+"="+c.cookieValues[name])
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (c *Client) mergeResponseCookies(resp *http.Response) {
+	if resp == nil {
+		return
+	}
+	for _, line := range resp.Header.Values("Set-Cookie") {
+		cookie, err := http.ParseSetCookie(line)
+		if err != nil || cookie == nil {
+			continue
+		}
+		if c.cookieValues == nil {
+			c.cookieValues = map[string]string{}
+		}
+		lowerLine := strings.ToLower(line)
+		expired := strings.Contains(lowerLine, "max-age=0") || cookie.MaxAge < 0 || (!cookie.Expires.IsZero() && !cookie.Expires.After(time.Now()))
+		if expired {
+			delete(c.cookieValues, cookie.Name)
+			continue
+		}
+		c.cookieValues[cookie.Name] = strings.Trim(strings.TrimSpace(cookie.Value), `"`)
+	}
+	if header := c.currentCookieHeader(); strings.TrimSpace(header) != "" {
+		c.CookieHeader = header
+		return
+	}
+	c.CookieHeader = ""
 }
 
 func normalizeBaseURL(baseURL string) string {
@@ -520,13 +638,92 @@ func (c *Client) traceRequest(requestURL string, payload []byte, headers http.He
 		}
 		value := values[0]
 		switch strings.ToLower(key) {
-		case "cookie", "x-csrf-token":
+		case "cookie", "x-csrf-token",
+			"x-uber-device-location-latitude",
+			"x-uber-device-location-longitude",
+			"x-uber-target-location-latitude",
+			"x-uber-target-location-longitude":
 			value = "REDACTED"
 		}
 		redacted[key] = value
 	}
-	fmt.Fprintf(c.LogWriter, "ubereats request method=POST url=%s headers=%v body=%s\n", requestURL, redacted, strings.TrimSpace(string(payload)))
-	fmt.Fprintf(c.LogWriter, "ubereats response status=%d url=%s body=%s\n", status, requestURL, strings.TrimSpace(body))
+	fmt.Fprintf(c.LogWriter, "ubereats request method=POST url=%s headers=%v body=%s\n", requestURL, redacted, redactJSONText(strings.TrimSpace(string(payload))))
+	fmt.Fprintf(c.LogWriter, "ubereats response status=%d url=%s body=%s\n", status, requestURL, redactJSONText(strings.TrimSpace(body)))
+}
+
+func redactJSONText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return text
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(text), &parsed); err != nil {
+		return fmt.Sprintf("<non-json %d bytes>", len(text))
+	}
+	redacted := redactJSONValue(parsed, "")
+	buf, err := json.Marshal(redacted)
+	if err != nil {
+		return fmt.Sprintf("<non-json %d bytes>", len(text))
+	}
+	return string(buf)
+}
+
+func redactJSONValue(value any, key string) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		if shouldRedactJSONKey(key) {
+			return "REDACTED"
+		}
+		out := make(map[string]any, len(typed))
+		for childKey, childValue := range typed {
+			out[childKey] = redactJSONValue(childValue, childKey)
+		}
+		return out
+	case []any:
+		if shouldRedactJSONKey(key) {
+			return "REDACTED"
+		}
+		out := make([]any, 0, len(typed))
+		for _, childValue := range typed {
+			out = append(out, redactJSONValue(childValue, key))
+		}
+		return out
+	default:
+		if shouldRedactJSONKey(key) {
+			return "REDACTED"
+		}
+		return value
+	}
+}
+
+func shouldRedactJSONKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case
+		"address",
+		"address1",
+		"address2",
+		"addresscomponents",
+		"addressdetails",
+		"aptorsuite",
+		"coordinate",
+		"deliverylocations",
+		"displaystring",
+		"email",
+		"firstname",
+		"fulladdress",
+		"lastname",
+		"latitude",
+		"location",
+		"locationpayload",
+		"longitude",
+		"notes",
+		"personalization",
+		"phone",
+		"selectedinstruction":
+		return true
+	default:
+		return false
+	}
 }
 
 func boolValue(v any) bool {

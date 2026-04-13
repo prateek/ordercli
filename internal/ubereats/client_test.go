@@ -79,7 +79,7 @@ func TestClientCheckSession_UsesProfileSessionWhenCookieMissing(t *testing.T) {
 	if sessionReads != 1 {
 		t.Fatalf("sessionReads=%d", sessionReads)
 	}
-	if len(requestCookies) != 1 || requestCookies[0] != "sid=abc; auth=xyz" {
+	if len(requestCookies) != 1 || !strings.Contains(requestCookies[0], "sid=abc") || !strings.Contains(requestCookies[0], "auth=xyz") {
 		t.Fatalf("requestCookies=%v", requestCookies)
 	}
 }
@@ -96,7 +96,7 @@ func TestClientListOrders_PastUsesPlainHTTPWithCookies(t *testing.T) {
 				if req.Method != http.MethodPost {
 					t.Fatalf("method=%s", req.Method)
 				}
-				if got := req.Header.Get("Cookie"); got != "sid=abc; auth=xyz" {
+				if got := req.Header.Get("Cookie"); !strings.Contains(got, "sid=abc") || !strings.Contains(got, "auth=xyz") {
 					t.Fatalf("cookie=%q", got)
 				}
 				if got := req.Header.Get("User-Agent"); got != "Mozilla/5.0 Test" {
@@ -144,6 +144,121 @@ func TestClientListOrders_PastUsesPlainHTTPWithCookies(t *testing.T) {
 	}
 	if len(requests) != 2 {
 		t.Fatalf("requests=%v", requests)
+	}
+}
+
+func TestClientListOrders_UsesUpdatedCookiesAcrossRequests(t *testing.T) {
+	var seenCookies []string
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: "sid=old; auth=xyz",
+		UserAgent:    "Mozilla/5.0 Test",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				seenCookies = append(seenCookies, req.Header.Get("Cookie"))
+				switch req.URL.Path {
+				case "/_p/api/getDeliveryLocationsV2":
+					resp := jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`)
+					resp.Header.Add("Set-Cookie", "sid=new; Path=/; HttpOnly")
+					return resp, nil
+				case "/_p/api/getPastOrdersV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"ordersMap":{
+								"past-1":{
+									"baseEaterOrder":{
+										"uuid":"past-1",
+										"displayName":"P-201",
+										"isCompleted":true,
+										"completedAt":"2026-04-12T18:00:00Z",
+										"currencyCode":"USD",
+										"shoppingCart":{"items":[{"title":"Bowl","quantity":1}]}
+									},
+									"storeInfo":{"title":"Chipotle"},
+									"fareInfo":{"checkoutInfo":[{"label":"Total","key":"eats_fare.total","rawValue":18.50}]}
+								}
+							},
+							"orderUuids":["past-1"],
+							"paginationData":{"nextCursor":""}
+						}
+					}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	orders, err := client.ListOrders(context.Background(), OrderFilterPast, 20)
+	if err != nil {
+		t.Fatalf("ListOrders: %v", err)
+	}
+	if len(orders) != 1 || orders[0].UUID != "past-1" {
+		t.Fatalf("orders=%+v", orders)
+	}
+	if len(seenCookies) != 2 {
+		t.Fatalf("seenCookies=%v", seenCookies)
+	}
+	if !strings.Contains(seenCookies[0], "sid=old") {
+		t.Fatalf("initial cookie=%q", seenCookies[0])
+	}
+	if !strings.Contains(seenCookies[1], "sid=new") || strings.Contains(seenCookies[1], "sid=old") {
+		t.Fatalf("rotated cookie=%q", seenCookies[1])
+	}
+}
+
+func TestClientListOrders_StripsQuotedCookieValuesWhenSeedingJar(t *testing.T) {
+	var seenCookies []string
+	client := &Client{
+		BaseURL:      "https://www.ubereats.com",
+		CookieHeader: `sid="quoted-value"; auth=xyz`,
+		UserAgent:    "Mozilla/5.0 Test",
+		HTTPClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				seenCookies = append(seenCookies, req.Header.Get("Cookie"))
+				switch req.URL.Path {
+				case "/_p/api/getDeliveryLocationsV2":
+					return jsonResponse(t, 200, `{"status":"success","data":{"deliveryLocations":{"TARGET":[{"location":{"id":"loc-1","fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`), nil
+				case "/_p/api/getPastOrdersV1":
+					return jsonResponse(t, 200, `{
+						"status":"success",
+						"data":{
+							"ordersMap":{
+								"past-1":{
+									"baseEaterOrder":{
+										"uuid":"past-1",
+										"displayName":"P-201",
+										"isCompleted":true,
+										"completedAt":"2026-04-12T18:00:00Z",
+										"currencyCode":"USD",
+										"shoppingCart":{"items":[{"title":"Bowl","quantity":1}]}
+									},
+									"storeInfo":{"title":"Chipotle"},
+									"fareInfo":{"checkoutInfo":[{"label":"Total","key":"eats_fare.total","rawValue":18.50}]}
+								}
+							},
+							"orderUuids":["past-1"],
+							"paginationData":{"nextCursor":""}
+						}
+					}`), nil
+				default:
+					t.Fatalf("unexpected request %s", req.URL.Path)
+					return nil, nil
+				}
+			}),
+		},
+	}
+
+	if _, err := client.ListOrders(context.Background(), OrderFilterPast, 20); err != nil {
+		t.Fatalf("ListOrders: %v", err)
+	}
+	if len(seenCookies) == 0 {
+		t.Fatalf("seenCookies=%v", seenCookies)
+	}
+	if !strings.Contains(seenCookies[0], "sid=quoted-value") || strings.Contains(seenCookies[0], `"quoted-value"`) {
+		t.Fatalf("seeded cookie=%q", seenCookies[0])
 	}
 }
 
@@ -490,5 +605,130 @@ func TestClientGetOrder_FailsWhenDefaultLocationUnavailable(t *testing.T) {
 	_, err := client.GetOrder(context.Background(), "past-9")
 	if err == nil || !strings.Contains(err.Error(), "no delivery location found") {
 		t.Fatalf("unexpected err=%v", err)
+	}
+}
+
+func TestClientCheckSession_WrapsBrowserRefreshErrors(t *testing.T) {
+	client := &Client{
+		BaseURL:    "https://www.ubereats.com",
+		ProfileDir: "/tmp/ubereats-profile",
+		ReadSession: func(context.Context, string, browserpage.Options) (browserpage.SessionResult, error) {
+			return browserpage.SessionResult{}, context.DeadlineExceeded
+		},
+	}
+
+	_, err := client.CheckSession(context.Background())
+	if err == nil {
+		t.Fatalf("expected error")
+	}
+	if !strings.Contains(err.Error(), "run `ordercli ubereats login`") {
+		t.Fatalf("unexpected err=%v", err)
+	}
+}
+
+func TestClientTraceRequest_RedactsSensitiveJSONFields(t *testing.T) {
+	var logBuf bytes.Buffer
+	client := &Client{LogWriter: &logBuf}
+
+	client.traceRequest(
+		"https://www.ubereats.com/_p/api/getDeliveryLocationsV2",
+		[]byte(`{"location":{"fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}},"userQuery":"pizza"}`),
+		http.Header{
+			"Cookie":                           []string{"sid=abc"},
+			"X-Csrf-Token":                     []string{"x"},
+			"X-Uber-Device-Location-Latitude":  []string{"40.7"},
+			"X-Uber-Device-Location-Longitude": []string{"-73.9"},
+		},
+		http.StatusOK,
+		`{"data":{"firstName":"Prateek","deliveryLocations":{"TARGET":[{"location":{"fullAddress":"222 E 39th St","coordinate":{"latitude":40.7,"longitude":-73.9}}}]}}}`,
+	)
+
+	logged := logBuf.String()
+	for _, forbidden := range []string{"222 E 39th St", "40.7", "-73.9", "Prateek", "sid=abc"} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("unexpected sensitive value %q in log=%s", forbidden, logged)
+		}
+	}
+	for _, want := range []string{"ubereats request method=POST", `"userQuery":"pizza"`, `"location":"REDACTED"`, `"firstName":"REDACTED"`, `X-Uber-Device-Location-Latitude:REDACTED`} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("missing %q in log=%s", want, logged)
+		}
+	}
+}
+
+func TestClientTraceRequest_RedactsNonJSONBodies(t *testing.T) {
+	var logBuf bytes.Buffer
+	client := &Client{LogWriter: &logBuf}
+
+	client.traceRequest(
+		"https://www.ubereats.com/_p/api/getUserV1",
+		[]byte(`not-json-secret`),
+		http.Header{},
+		http.StatusBadGateway,
+		`<html>secret-response</html>`,
+	)
+
+	logged := logBuf.String()
+	for _, forbidden := range []string{"not-json-secret", "secret-response"} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("unexpected sensitive value %q in log=%s", forbidden, logged)
+		}
+	}
+	for _, want := range []string{"<non-json 15 bytes>", "<non-json 28 bytes>"} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("missing %q in log=%s", want, logged)
+		}
+	}
+}
+
+func TestClientMergeResponseCookies_RemovesExpiredCookies(t *testing.T) {
+	client := &Client{}
+	client.SetCookieHeader("sid=old; auth=xyz")
+
+	resp := &http.Response{
+		Header: http.Header{
+			"Set-Cookie": []string{
+				"sid=deleted; Path=/; Max-Age=0",
+				"auth=deleted; Path=/; Max-Age=0",
+			},
+		},
+	}
+	client.mergeResponseCookies(resp)
+
+	if got := client.currentCookieHeader(); got != "" {
+		t.Fatalf("cookie_header=%q", got)
+	}
+	if client.hasSessionCookies() {
+		t.Fatalf("expected empty session cookies")
+	}
+}
+
+func TestClientSetCookieHeader_ReplacesExistingCookieState(t *testing.T) {
+	client := &Client{}
+	client.SetCookieHeader("sid=old; auth=xyz")
+	client.mergeResponseCookies(&http.Response{
+		Header: http.Header{
+			"Set-Cookie": []string{"pref=abc; Path=/"},
+		},
+	})
+
+	client.SetCookieHeader("sid=new")
+
+	if got := client.currentCookieHeader(); got != "sid=new" {
+		t.Fatalf("cookie_header=%q", got)
+	}
+}
+
+func TestClientHasSessionCookies_IgnoresNonAuthCookies(t *testing.T) {
+	client := &Client{}
+	client.SetCookieHeader("uev2.loc=abc; u-cookie-prefs=xyz")
+
+	if client.hasSessionCookies() {
+		t.Fatalf("expected non-auth cookies to be ignored")
+	}
+
+	client.SetCookieHeader("sid=abc; uev2.loc=abc")
+	if !client.hasSessionCookies() {
+		t.Fatalf("expected auth cookie to count as session")
 	}
 }
