@@ -406,6 +406,58 @@ func TestUberEatsCLI_Config_Login_Logout_Orders(t *testing.T) {
 	}
 }
 
+func TestUberEatsCLI_TraceFlagOverridesDebugDefault(t *testing.T) {
+	t.Run("enables trace for one command", func(t *testing.T) {
+		cfgPath := filepath.Join(t.TempDir(), "config.json")
+		oldFactory := uberEatsClientFactory
+		t.Cleanup(func() { uberEatsClientFactory = oldFactory })
+		uberEatsClientFactory = func(st *state, _ uberEatsCommand) uberEatsClient {
+			if !st.ubereats().Debug {
+				t.Fatalf("expected debug on for --trace")
+			}
+			return fakeUberEatsClient{
+				listCarts: func(context.Context, int) ([]ubereats.Cart, error) { return nil, nil },
+			}
+		}
+
+		out, _, err := runCLI(cfgPath, []string{"ubereats", "carts", "list", "--trace", "--json"}, "")
+		if err != nil {
+			t.Fatalf("carts list --trace: %v out=%s", err, out)
+		}
+		if !strings.Contains(out, `"ok": true`) {
+			t.Fatalf("unexpected out=%s", out)
+		}
+	})
+
+	t.Run("disables persisted debug for one command", func(t *testing.T) {
+		cfgPath := filepath.Join(t.TempDir(), "config.json")
+		cfg := config.New()
+		cfg.UberEats().Debug = true
+		if err := config.Save(cfgPath, cfg); err != nil {
+			t.Fatalf("save config: %v", err)
+		}
+
+		oldFactory := uberEatsClientFactory
+		t.Cleanup(func() { uberEatsClientFactory = oldFactory })
+		uberEatsClientFactory = func(st *state, _ uberEatsCommand) uberEatsClient {
+			if st.ubereats().Debug {
+				t.Fatalf("expected debug off for --trace=false")
+			}
+			return fakeUberEatsClient{
+				listCarts: func(context.Context, int) ([]ubereats.Cart, error) { return nil, nil },
+			}
+		}
+
+		out, _, err := runCLI(cfgPath, []string{"ubereats", "carts", "list", "--trace=false", "--json"}, "")
+		if err != nil {
+			t.Fatalf("carts list --trace=false: %v out=%s", err, out)
+		}
+		if !strings.Contains(out, `"ok": true`) {
+			t.Fatalf("unexpected out=%s", out)
+		}
+	})
+}
+
 func TestUberEatsCLI_StoresAndItems(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	oldFactory := uberEatsClientFactory
