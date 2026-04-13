@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -20,22 +19,39 @@ import (
 var fetchScript []byte
 
 type Options struct {
-	Timeout    time.Duration
-	Headless   bool
-	LogWriter  io.Writer
-	Playwright string
+	Timeout                      time.Duration
+	Headless                     bool
+	LogWriter                    io.Writer
+	Playwright                   string
+	ProfileDir                   string
+	WaitForURLSubstrings         []string
+	CaptureResponseURLSubstrings []string
+	CaptureResponseBodyBytes     int
+}
+
+type CapturedResponse struct {
+	URL         string `json:"url"`
+	Status      int    `json:"status"`
+	ContentType string `json:"content_type,omitempty"`
+	Body        string `json:"body,omitempty"`
 }
 
 type Result struct {
-	FinalURL string `json:"final_url"`
-	Title    string `json:"title"`
-	Text     string `json:"text"`
+	FinalURL  string             `json:"final_url"`
+	Title     string             `json:"title"`
+	Text      string             `json:"text"`
+	UserAgent string             `json:"user_agent,omitempty"`
+	Responses []CapturedResponse `json:"responses,omitempty"`
 }
 
 type scriptInput struct {
-	URL           string `json:"url"`
-	TimeoutMillis int    `json:"timeout_millis"`
-	Headless      bool   `json:"headless"`
+	URL                          string   `json:"url"`
+	TimeoutMillis                int      `json:"timeout_millis"`
+	Headless                     bool     `json:"headless"`
+	ProfileDir                   string   `json:"profile_dir,omitempty"`
+	WaitForURLSubstrings         []string `json:"wait_for_url_substrings,omitempty"`
+	CaptureResponseURLSubstrings []string `json:"capture_response_url_substrings,omitempty"`
+	CaptureResponseBodyBytes     int      `json:"capture_response_body_bytes,omitempty"`
 }
 
 var runFetchScriptFunc = runFetchScript
@@ -66,9 +82,16 @@ func ReadText(ctx context.Context, targetURL string, opts Options) (Result, erro
 	outPath := filepath.Join(td, "out.json")
 
 	in := scriptInput{
-		URL:           targetURL,
-		TimeoutMillis: int(opts.Timeout.Milliseconds()),
-		Headless:      opts.Headless,
+		URL:                          targetURL,
+		TimeoutMillis:                int(opts.Timeout.Milliseconds()),
+		Headless:                     opts.Headless,
+		ProfileDir:                   strings.TrimSpace(opts.ProfileDir),
+		WaitForURLSubstrings:         append([]string(nil), opts.WaitForURLSubstrings...),
+		CaptureResponseURLSubstrings: append([]string(nil), opts.CaptureResponseURLSubstrings...),
+		CaptureResponseBodyBytes:     opts.CaptureResponseBodyBytes,
+	}
+	if len(in.CaptureResponseURLSubstrings) > 0 && in.CaptureResponseBodyBytes <= 0 {
+		in.CaptureResponseBodyBytes = 64 * 1024
 	}
 	b, _ := json.Marshal(in)
 
@@ -85,48 +108,19 @@ func ReadText(ctx context.Context, targetURL string, opts Options) (Result, erro
 }
 
 func runFetchScript(ctx context.Context, td, scriptPath, outPath string, input []byte, opts Options, playwright string) ([]byte, error) {
-	if _, err := exec.LookPath("node"); err != nil {
-		return nil, errors.New("browserpage: node not found")
-	}
-	if _, err := exec.LookPath("npm"); err != nil {
-		return nil, errors.New("browserpage: npm not found")
-	}
-
 	cmdCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
-
-	install := exec.CommandContext(cmdCtx, "npm", "install", "--silent", "--no-progress", "--no-fund", "--no-audit", playwright) //nolint:gosec
-	install.Dir = td
-	install.Stdout = io.Discard
-	if opts.LogWriter != nil {
-		install.Stderr = opts.LogWriter
-	} else {
-		install.Stderr = io.Discard
+	projectDir, err := ensurePlaywrightProject(cmdCtx, playwright, opts.LogWriter)
+	if err != nil {
+		return nil, err
 	}
-	install.Env = append(os.Environ(), "npm_config_loglevel=error")
-	if err := install.Run(); err != nil {
-		return nil, fmt.Errorf("browserpage: npm install %s: %w", playwright, err)
-	}
-
-	playwrightBin := filepath.Join(td, "node_modules", ".bin", "playwright")
-	if runtime.GOOS == "windows" {
-		playwrightBin += ".cmd"
-	}
-	installBrowsers := exec.CommandContext(cmdCtx, playwrightBin, "install", "chromium") //nolint:gosec
-	installBrowsers.Dir = td
-	installBrowsers.Stdout = io.Discard
-	if opts.LogWriter != nil {
-		installBrowsers.Stderr = opts.LogWriter
-	} else {
-		installBrowsers.Stderr = io.Discard
-	}
-	installBrowsers.Env = append(os.Environ(), "npm_config_loglevel=error")
-	if err := installBrowsers.Run(); err != nil {
-		return nil, fmt.Errorf("browserpage: playwright install chromium: %w", err)
+	scriptPath, err = writePlaywrightScript(projectDir, "fetch.mjs", fetchScript)
+	if err != nil {
+		return nil, err
 	}
 
 	cmd := exec.CommandContext(cmdCtx, "node", scriptPath) //nolint:gosec
-	cmd.Dir = td
+	cmd.Dir = projectDir
 	cmd.Env = append(os.Environ(),
 		"ORDERCLI_OUTPUT_PATH="+outPath,
 		"npm_config_loglevel=error",

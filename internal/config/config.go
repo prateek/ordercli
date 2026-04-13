@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -18,6 +20,7 @@ type Config struct {
 type Providers struct {
 	Foodora   *FoodoraConfig   `json:"foodora,omitempty"`
 	Deliveroo *DeliverooConfig `json:"deliveroo,omitempty"`
+	UberEats  *UberEatsConfig  `json:"ubereats,omitempty"`
 }
 
 type FoodoraConfig struct {
@@ -43,6 +46,14 @@ type FoodoraConfig struct {
 type DeliverooConfig struct {
 	Market  string `json:"market,omitempty"`
 	BaseURL string `json:"base_url,omitempty"`
+}
+
+type UberEatsConfig struct {
+	BaseURL              string        `json:"base_url,omitempty"`
+	BrowserProfile       string        `json:"browser_profile,omitempty"`
+	HTTPUserAgent        string        `json:"http_user_agent,omitempty"`
+	DefaultWatchInterval time.Duration `json:"default_watch_interval,omitempty"`
+	Debug                bool          `json:"debug,omitempty"`
 }
 
 func DefaultPath() (string, error) {
@@ -155,6 +166,44 @@ func (c *Config) Deliveroo() *DeliverooConfig {
 		c.Providers.Deliveroo = &DeliverooConfig{}
 	}
 	return c.Providers.Deliveroo
+}
+
+func (c *Config) UberEats() *UberEatsConfig {
+	if c.Providers.UberEats == nil {
+		c.Providers.UberEats = &UberEatsConfig{}
+	}
+	c.Providers.UberEats.BaseURL = normalizeUberEatsBaseURL(c.Providers.UberEats.BaseURL)
+	if c.Providers.UberEats.DefaultWatchInterval <= 0 {
+		c.Providers.UberEats.DefaultWatchInterval = 15 * time.Second
+	}
+	return c.Providers.UberEats
+}
+
+func normalizeUberEatsBaseURL(baseURL string) string {
+	const defaultBaseURL = "https://www.ubereats.com"
+
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		return defaultBaseURL
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return defaultBaseURL
+	}
+	if u.Scheme != "https" {
+		return defaultBaseURL
+	}
+	if !strings.EqualFold(u.Hostname(), "www.ubereats.com") {
+		return defaultBaseURL
+	}
+	if port := strings.TrimSpace(u.Port()); port != "" && port != "443" {
+		return defaultBaseURL
+	}
+	u.Host = u.Hostname()
+	u.Path = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimRight(u.String(), "/")
 }
 
 func (c FoodoraConfig) HasSession() bool {

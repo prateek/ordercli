@@ -28,17 +28,9 @@ func ResolveLatestDeliverooStatusURL(ctx context.Context, browser string) (strin
 		browser = BrowserAuto
 	}
 
-	var paths []string
-	switch browser {
-	case BrowserAuto:
-		paths = append(paths, atlasHistoryPaths()...)
-		paths = append(paths, chromeHistoryPaths()...)
-	case BrowserAtlas:
-		paths = atlasHistoryPaths()
-	case BrowserChrome:
-		paths = chromeHistoryPaths()
-	default:
-		return "", fmt.Errorf("unsupported browser %q", browser)
+	paths, err := historyPathsForBrowser(browser)
+	if err != nil {
+		return "", err
 	}
 	if len(paths) == 0 {
 		return "", errors.New("no browser history files found")
@@ -68,6 +60,22 @@ func browserLabel(browser string) string {
 		return "Chrome"
 	default:
 		return "Atlas/Chrome"
+	}
+}
+
+func historyPathsForBrowser(browser string) ([]string, error) {
+	switch browser {
+	case BrowserAuto:
+		var paths []string
+		paths = append(paths, atlasHistoryPaths()...)
+		paths = append(paths, chromeHistoryPaths()...)
+		return paths, nil
+	case BrowserAtlas:
+		return atlasHistoryPaths(), nil
+	case BrowserChrome:
+		return chromeHistoryPaths(), nil
+	default:
+		return nil, fmt.Errorf("unsupported browser %q", browser)
 	}
 }
 

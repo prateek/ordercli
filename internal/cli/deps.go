@@ -2,13 +2,17 @@ package cli
 
 import (
 	"context"
+	"io"
+	"os"
 	"time"
 
 	"github.com/steipete/ordercli/internal/browserauth"
 	"github.com/steipete/ordercli/internal/browserhistory"
+	"github.com/steipete/ordercli/internal/browserpage"
 	"github.com/steipete/ordercli/internal/chromecookies"
 	"github.com/steipete/ordercli/internal/deliveroo"
 	"github.com/steipete/ordercli/internal/foodora"
+	"github.com/steipete/ordercli/internal/ubereats"
 )
 
 var chromeLoadCookieHeader = chromecookies.LoadCookieHeader
@@ -21,4 +25,65 @@ var deliverooResolveLatestStatusURL = browserhistory.ResolveLatestDeliverooStatu
 
 var deliverooFetchPublicStatus = func(ctx context.Context, targetURL string, timeout time.Duration) (deliveroo.PublicStatus, error) {
 	return deliveroo.FetchPublicStatus(ctx, targetURL, timeout)
+}
+
+type browserLoginResult struct {
+	FinalURL     string
+	UserAgent    string
+	CookieHeader string
+}
+
+var uberEatsLoginBrowser = func(ctx context.Context, targetURL string, profileDir string, timeout time.Duration) (browserLoginResult, error) {
+	res, err := browserpage.ReadSession(ctx, targetURL, browserpage.Options{
+		Timeout:              timeout,
+		Headless:             false,
+		ProfileDir:           profileDir,
+		WaitForURLSubstrings: []string{"/orders"},
+	})
+	if err != nil {
+		return browserLoginResult{}, err
+	}
+	return browserLoginResult{
+		FinalURL:     res.FinalURL,
+		UserAgent:    res.UserAgent,
+		CookieHeader: res.CookieHeader,
+	}, nil
+}
+
+type uberEatsCommand struct{}
+
+type uberEatsClient interface {
+	SetCookieHeader(string)
+	CheckSession(context.Context) (ubereats.Session, error)
+	ListLocations(context.Context) ([]ubereats.Location, error)
+	DefaultLocation(context.Context) (ubereats.Location, error)
+	GetInstructionContext(context.Context, ubereats.Location) (ubereats.InstructionContext, error)
+	ListCarts(context.Context, int) ([]ubereats.Cart, error)
+	GetCart(context.Context, string) (ubereats.Cart, error)
+	CreateCartFromItem(context.Context, string, string, int, string) (ubereats.Cart, error)
+	CreateCartFromOrder(context.Context, string) (ubereats.Cart, error)
+	AddCartItem(context.Context, string, string, int, string) (ubereats.CartMutation, error)
+	UpdateCartItem(context.Context, string, string, ubereats.CartItemUpdate) (ubereats.CartMutation, error)
+	UpdateCart(context.Context, string, ubereats.CartUpdate) (ubereats.CartMutation, error)
+	GetCheckoutPreview(context.Context, string) (ubereats.CheckoutPreview, error)
+	CheckoutCart(context.Context, string) (ubereats.CheckoutResult, error)
+	RemoveCartItem(context.Context, string, string) (ubereats.CartMutation, error)
+	DiscardCart(context.Context, string) (ubereats.CartMutation, error)
+	ListStores(context.Context, bool, int) ([]ubereats.Store, error)
+	GetStore(context.Context, string) (ubereats.Store, error)
+	GetStoreMenu(context.Context, string) (ubereats.StoreMenu, error)
+	SearchStores(context.Context, string, int) ([]ubereats.Store, error)
+	SearchItems(context.Context, string, int) ([]ubereats.StoreItem, error)
+	SearchStoreItems(context.Context, string, string, int) ([]ubereats.StoreItem, error)
+	GetMenuItem(context.Context, string, string) (ubereats.ItemDetail, error)
+	ListOrders(context.Context, ubereats.OrderFilter, int) ([]ubereats.Order, error)
+	GetOrder(context.Context, string) (ubereats.Order, error)
+}
+
+var uberEatsClientFactory = func(st *state, cmd uberEatsCommand) uberEatsClient {
+	logWriter := io.Writer(nil)
+	if st.ubereats().Debug {
+		logWriter = os.Stderr
+	}
+	return ubereats.NewClient(st.ubereats().BaseURL, st.ubereats().BrowserProfile, st.ubereats().HTTPUserAgent, logWriter)
 }

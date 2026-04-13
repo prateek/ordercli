@@ -79,3 +79,14 @@ func TestDefaultPath(t *testing.T) {
 		t.Fatalf("unexpected path: %q", p)
 	}
 }
+
+func TestUberEatsConfig_DefaultsBaseURL(t *testing.T) {
+	cfg := New()
+	uc := cfg.UberEats()
+	if uc.BaseURL != "https://www.ubereats.com" {
+		t.Fatalf("base_url=%q", uc.BaseURL)
+	}
+	if uc.DefaultWatchInterval != 15*time.Second {
+		t.Fatalf("default_watch_interval=%s", uc.DefaultWatchInterval)
+	}
+}
