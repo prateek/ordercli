@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -109,48 +108,19 @@ func ReadText(ctx context.Context, targetURL string, opts Options) (Result, erro
 }
 
 func runFetchScript(ctx context.Context, td, scriptPath, outPath string, input []byte, opts Options, playwright string) ([]byte, error) {
-	if _, err := exec.LookPath("node"); err != nil {
-		return nil, errors.New("browserpage: node not found")
-	}
-	if _, err := exec.LookPath("npm"); err != nil {
-		return nil, errors.New("browserpage: npm not found")
-	}
-
 	cmdCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
-
-	install := exec.CommandContext(cmdCtx, "npm", "install", "--silent", "--no-progress", "--no-fund", "--no-audit", playwright) //nolint:gosec
-	install.Dir = td
-	install.Stdout = io.Discard
-	if opts.LogWriter != nil {
-		install.Stderr = opts.LogWriter
-	} else {
-		install.Stderr = io.Discard
+	projectDir, err := ensurePlaywrightProject(cmdCtx, playwright, opts.LogWriter)
+	if err != nil {
+		return nil, err
 	}
-	install.Env = append(os.Environ(), "npm_config_loglevel=error")
-	if err := install.Run(); err != nil {
-		return nil, fmt.Errorf("browserpage: npm install %s: %w", playwright, err)
-	}
-
-	playwrightBin := filepath.Join(td, "node_modules", ".bin", "playwright")
-	if runtime.GOOS == "windows" {
-		playwrightBin += ".cmd"
-	}
-	installBrowsers := exec.CommandContext(cmdCtx, playwrightBin, "install", "chromium") //nolint:gosec
-	installBrowsers.Dir = td
-	installBrowsers.Stdout = io.Discard
-	if opts.LogWriter != nil {
-		installBrowsers.Stderr = opts.LogWriter
-	} else {
-		installBrowsers.Stderr = io.Discard
-	}
-	installBrowsers.Env = append(os.Environ(), "npm_config_loglevel=error")
-	if err := installBrowsers.Run(); err != nil {
-		return nil, fmt.Errorf("browserpage: playwright install chromium: %w", err)
+	scriptPath, err = writePlaywrightScript(projectDir, "fetch.mjs", fetchScript)
+	if err != nil {
+		return nil, err
 	}
 
 	cmd := exec.CommandContext(cmdCtx, "node", scriptPath) //nolint:gosec
-	cmd.Dir = td
+	cmd.Dir = projectDir
 	cmd.Env = append(os.Environ(),
 		"ORDERCLI_OUTPUT_PATH="+outPath,
 		"npm_config_loglevel=error",

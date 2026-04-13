@@ -47,9 +47,11 @@ type DeliverooConfig struct {
 }
 
 type UberEatsConfig struct {
-	BaseURL        string `json:"base_url,omitempty"`
-	BrowserProfile string `json:"browser_profile,omitempty"`
-	HTTPUserAgent  string `json:"http_user_agent,omitempty"`
+	BaseURL              string        `json:"base_url,omitempty"`
+	BrowserProfile       string        `json:"browser_profile,omitempty"`
+	HTTPUserAgent        string        `json:"http_user_agent,omitempty"`
+	DefaultWatchInterval time.Duration `json:"default_watch_interval,omitempty"`
+	Debug                bool          `json:"debug,omitempty"`
 }
 
 func DefaultPath() (string, error) {
@@ -170,6 +172,9 @@ func (c *Config) UberEats() *UberEatsConfig {
 	}
 	if c.Providers.UberEats.BaseURL == "" {
 		c.Providers.UberEats.BaseURL = "https://www.ubereats.com"
+	}
+	if c.Providers.UberEats.DefaultWatchInterval <= 0 {
+		c.Providers.UberEats.DefaultWatchInterval = 15 * time.Second
 	}
 	return c.Providers.UberEats
 }

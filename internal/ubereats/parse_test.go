@@ -222,6 +222,55 @@ func TestParsePage_FiltersDuplicateOrders(t *testing.T) {
 	}
 }
 
+func TestParsePage_FiltersDuplicateOrdersByUUIDAcrossStates(t *testing.T) {
+	res := browserpage.Result{
+		FinalURL: "https://www.ubereats.com/orders/",
+		Responses: []browserpage.CapturedResponse{
+			{
+				URL:         "https://www.ubereats.com/_p/api/getActiveOrdersV1",
+				Status:      200,
+				ContentType: "application/json",
+				Body: `{
+					"status":"success",
+					"data":{
+						"orders":[
+							{
+								"orderUuid":"dupe-2",
+								"orderNumber":"A-100",
+								"storeInfo":{"title":"Store A"},
+								"currentStatus":{"title":"Preparing"},
+								"baseEaterOrder":{"uuid":"dupe-2","createdAt":"2026-04-12T10:00:00Z"}
+							}
+						]
+					}
+				}`,
+			},
+			{
+				URL:         "https://www.ubereats.com/_p/api/getPastOrdersV1",
+				Status:      200,
+				ContentType: "application/json",
+				Body: `{
+					"status":"success",
+					"data":{
+						"ordersMap":{
+							"dupe-2":{
+								"baseEaterOrder":{"uuid":"dupe-2","isCompleted":true,"completedAt":"2026-04-12T11:00:00Z"},
+								"storeInfo":{"title":"Store A"},
+								"fareInfo":{"checkoutInfo":[{"label":"Total","key":"eats_fare.total","rawValue":12.50}]}
+							}
+						}
+					}
+				}`,
+			},
+		},
+	}
+
+	page := ParsePage(res)
+	if len(page.Orders) != 1 {
+		t.Fatalf("orders=%+v", page.Orders)
+	}
+}
+
 func TestBuildOrderURL(t *testing.T) {
 	got, err := BuildOrderURL("https://www.ubereats.com", "abc-123")
 	if err != nil {

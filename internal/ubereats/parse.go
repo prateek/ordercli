@@ -13,19 +13,29 @@ import (
 )
 
 type Order struct {
-	UUID         string   `json:"uuid,omitempty"`
-	URL          string   `json:"url,omitempty"`
-	OrderNumber  string   `json:"order_number,omitempty"`
-	Merchant     string   `json:"merchant,omitempty"`
-	Status       string   `json:"status,omitempty"`
-	StatusDetail string   `json:"status_detail,omitempty"`
-	ETA          string   `json:"eta,omitempty"`
-	Total        string   `json:"total,omitempty"`
-	Courier      string   `json:"courier,omitempty"`
-	StoreAddress string   `json:"store_address,omitempty"`
-	Items        []string `json:"items,omitempty"`
-	Active       bool     `json:"active"`
+	UUID         string      `json:"uuid,omitempty"`
+	URL          string      `json:"url,omitempty"`
+	OrderNumber  string      `json:"order_number,omitempty"`
+	Merchant     string      `json:"merchant,omitempty"`
+	Status       string      `json:"status,omitempty"`
+	StatusDetail string      `json:"status_detail,omitempty"`
+	ETA          string      `json:"eta,omitempty"`
+	Total        string      `json:"total,omitempty"`
+	Courier      string      `json:"courier,omitempty"`
+	StoreAddress string      `json:"store_address,omitempty"`
+	Items        []string    `json:"items,omitempty"`
+	Active       bool        `json:"active"`
+	OccurredAt   string      `json:"occurred_at,omitempty"`
+	SessionInfo  SessionInfo `json:"session,omitempty"`
 	occurredAt   time.Time
+}
+
+type SessionInfo struct {
+	LocationSource    string `json:"location_source,omitempty"`
+	LocationRef       string `json:"location_ref,omitempty"`
+	Location          string `json:"location,omitempty"`
+	Profile           string `json:"profile,omitempty"`
+	PaymentProfileRef string `json:"payment_profile_ref,omitempty"`
 }
 
 type Page struct {
@@ -148,6 +158,9 @@ func orderFromMap(m map[string]any, finalURL string) (Order, bool) {
 	}
 
 	order.Active = isActiveOrder(m, order.Status, order.StatusDetail)
+	if !order.occurredAt.IsZero() {
+		order.OccurredAt = order.occurredAt.UTC().Format(time.RFC3339)
+	}
 	return order, true
 }
 
@@ -211,12 +224,14 @@ func dedupeOrders(in []Order) []Order {
 	out := make([]Order, 0, len(in))
 	seen := map[string]struct{}{}
 	for _, order := range in {
-		key := strings.ToLower(strings.Join([]string{
-			order.UUID,
-			order.OrderNumber,
-			order.Merchant,
-			order.Status,
-		}, "|"))
+		key := strings.TrimSpace(order.UUID)
+		if key == "" {
+			key = strings.ToLower(strings.Join([]string{
+				order.OrderNumber,
+				order.Merchant,
+				order.Status,
+			}, "|"))
+		}
 		if key == "|||" {
 			continue
 		}

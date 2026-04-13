@@ -166,23 +166,24 @@ export DELIVEROO_COOKIE='...' # optional
 
 ```sh
 ./ordercli ubereats config set --browser-profile "$HOME/Library/Application Support/ordercli/ubereats-profile"
-./ordercli ubereats login --browser
+./ordercli ubereats login
 ```
 
 After that:
 
 ```sh
-./ordercli ubereats orders
-./ordercli ubereats history
-./ordercli ubereats history --limit 10
-./ordercli ubereats order <orderUuid>
-./ordercli ubereats order latest
+./ordercli ubereats orders list
+./ordercli ubereats orders list --filter past --limit 10
+./ordercli ubereats orders show <orderUuid>
+./ordercli ubereats logout --yes
 ```
 
 Notes:
-- `login --browser` opens a real Playwright Chromium window and waits until you land on an Uber Eats orders page.
-- `orders`, `history`, and `order` reuse the stored browser profile in headless Chromium and extract order data from first-party JSON responses captured while the page loads.
-- If you are not signed in, commands fail with a prompt to run `ordercli ubereats login --browser`.
+- `login` opens a real Playwright Chromium window and waits until you land on an Uber Eats orders page.
+- `login` verifies the authenticated session and stores the CLI-managed browser profile plus user agent.
+- `orders` reuses the CLI-managed browser profile to extract fresh session cookies, then talks to the Uber Eats JSON endpoints over plain HTTP.
+- Hidden compatibility aliases for `history`, `order`, and `login --browser` still exist for older scripts.
+- If you are not signed in, commands fail with a prompt to run `ordercli ubereats login`.
 
 ## Safety
 

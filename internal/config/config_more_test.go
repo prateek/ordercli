@@ -86,4 +86,7 @@ func TestUberEatsConfig_DefaultsBaseURL(t *testing.T) {
 	if uc.BaseURL != "https://www.ubereats.com" {
 		t.Fatalf("base_url=%q", uc.BaseURL)
 	}
+	if uc.DefaultWatchInterval != 15*time.Second {
+		t.Fatalf("default_watch_interval=%s", uc.DefaultWatchInterval)
+	}
 }
